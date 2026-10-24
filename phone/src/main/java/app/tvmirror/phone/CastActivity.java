@@ -214,6 +214,13 @@ public final class CastActivity extends Activity {
             toggleButton.setText(running ? R.string.stop : R.string.start);
             toggleButton.setBackgroundResource(
                     running ? R.drawable.bg_button_danger : R.drawable.bg_button_primary);
+            // 投屏期间保持屏幕常亮：小米在锁屏时会直接收回 MediaProjection，
+            // 一旦自动息屏投屏就必然中断，所以从源头避免它自己锁屏。
+            if (running) {
+                getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+            } else {
+                getWindow().clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+            }
             if (!running) {
                 String error = CaptureService.lastError();
                 if (error != null) {

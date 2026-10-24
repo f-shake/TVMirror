@@ -360,8 +360,11 @@ public final class CaptureService extends Service implements Sender.Listener {
                     if (!running) {
                         return;
                     }
-                    if (screenOff) {
-                        // 锁屏期间没有画面是正常的，不要重建、更不要判失败
+                    // 息屏瞬间广播可能还没到，先直接问电源状态：
+                    // 否则会把「锁屏导致没有画面」误判成故障，去重建编码器
+                    android.os.PowerManager pm =
+                            (android.os.PowerManager) getSystemService(POWER_SERVICE);
+                    if (screenOff || (pm != null && !pm.isInteractive())) {
                         recovering = false;
                         continue;
                     }
