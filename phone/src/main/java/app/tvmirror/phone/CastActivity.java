@@ -37,6 +37,8 @@ public final class CastActivity extends Activity {
 
     private TextView statusView;
     private TextView deviceView;
+    /** 「电视/搜索电视」整张卡片：投屏中隐藏。 */
+    private View deviceCardView;
     private EditText pinInput;
     private EditText ipInput;
     private Spinner presetSpinner;
@@ -75,7 +77,7 @@ public final class CastActivity extends Activity {
     private EncoderCaps.Plan plan;
     private int deviceMaxFps = 60;
     /** 上一次轮询时是否处于投屏状态，用来判断「刚结束」并复位状态文案。 */
-    private boolean casting;
+    private boolean wasCasting;
     /** 接收端缓冲（毫秒）；0 表示用电视端默认的小缓冲。 */
     private int bufferMs;
     /** 是否把声音一起投过去。 */
@@ -119,6 +121,25 @@ public final class CastActivity extends Activity {
         resolutionSpinner = findViewById(R.id.resolution);
         scanButton = findViewById(R.id.scan);
         toggleButton = findViewById(R.id.toggle);
+        deviceCardView = findViewById(R.id.deviceCard);
+
+        // 长按「开始/停止」切换是否投声音，并在状态里显示出来。
+        // 声音开关没有独立控件，但它必须可发现、可恢复，不能只靠启动参数。
+        toggleButton.setOnLongClickListener(new View.OnLongClickListener() {
+            @Override
+            public boolean onLongClick(View v) {
+                audioEnabled = !audioEnabled;
+                getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+                        .putBoolean("audioEnabled", audioEnabled).apply();
+                if (!CaptureService.isRunning()) {
+                    setStatus(idleStatus());
+                }
+                Toast.makeText(CastActivity.this,
+                        audioEnabled ? "下次投屏会带上声音" : "下次投屏不投声音",
+                        Toast.LENGTH_SHORT).show();
+                return true;
+            }
+        });
 
         setupImmersive();
         setupQuality();
@@ -249,6 +270,12 @@ public final class CastActivity extends Activity {
         @Override
         public void run() {
             boolean running = CaptureService.isRunning();
+            // 用「连接是否真的建立」而不是 running 判断展示阶段：
+            // running 在 onStartCommand 一开始就为 true，早于 TCP 握手完成
+            boolean connected = CaptureService.isConnected();
+            boolean paused = CaptureService.isPaused();
+            boolean casting = connected && !paused;
+
             toggleButton.setText(running ? R.string.stop : R.string.start);
             toggleButton.setBackgroundResource(
                     running ? R.drawable.bg_button_danger : R.drawable.bg_button_primary);
@@ -259,30 +286,27 @@ public final class CastActivity extends Activity {
             } else {
                 getWindow().clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
             }
-            // 投屏中整张「电视/搜索电视」卡片都不该占位，停止后再恢复
-            View card = findViewById(R.id.deviceCard);
-            if (card != null) {
-                card.setVisibility(running ? View.GONE : View.VISIBLE);
+            // 只有真正在投屏时才隐藏「电视/搜索电视」卡片；连接中、暂停时保留
+            if (deviceCardView != null) {
+                deviceCardView.setVisibility(casting ? View.GONE : View.VISIBLE);
             }
-            // 连上之后要把「正在连接电视…」换掉，否则电视都出画面了还写着正在连接
-            if (running && !casting) {
-                String host = targetHost == null || targetHost.isEmpty() ? "电视" : targetHost;
-                setStatus("正在投屏到 " + host);
-            }
-            // 错误既可能发生在结束时（断线），也可能发生在运行中（暂停/恢复失败），
-            // 所以这里不区分运行状态，一律展示并清掉
+
             String error = CaptureService.lastError();
             if (error != null) {
+                // 错误既可能发生在结束时（断线），也可能发生在运行中（暂停/恢复失败）
                 setErrorStatus(error);
                 CaptureService.clearError();
-            } else if (!running) {
-                if (casting) {
-                    // 服务被系统回收/静默结束时没有 error，状态文案必须复位，
-                    // 否则按钮已经变回「开始投屏」，文案却还写着「正在投屏到…」
-                    setStatus("准备就绪");
+            } else if (casting) {
+                if (!wasCasting) {
+                    setStatus("正在投屏到 " + hostLabel());
                 }
+            } else if (running) {
+                setStatus(paused ? "投屏已暂停，等待重新授权" : "正在连接电视…");
+            } else if (wasCasting) {
+                setStatus(idleStatus());
             }
-            casting = running;
+
+            wasCasting = casting;
             handler.postDelayed(this, 500);
         }
     };
@@ -632,6 +656,20 @@ public final class CastActivity extends Activity {
                 running ? R.drawable.bg_button_danger : R.drawable.bg_button_primary);
     }
 
+    /** 状态栏里显示的电视地址：字段没回填时退回输入框内容，避免出现「正在投屏到 电视」。 */
+    private String hostLabel() {
+        String host = targetHost;
+        if (host == null || host.isEmpty()) {
+            host = ipInput == null ? null : ipInput.getText().toString().trim();
+        }
+        return host == null || host.isEmpty() ? "电视" : host;
+    }
+
+    /** 空闲态文案：把「当前是否投声音」明确写出来，否则这个开关完全不可见。 */
+    private String idleStatus() {
+        return audioEnabled ? "准备就绪" : "准备就绪（当前不投声音）";
+    }
+
     private void setStatus(String text) {
         statusView.setText(text);
         statusView.setTextColor(getColor(R.color.accent));
@@ -661,8 +699,10 @@ public final class CastActivity extends Activity {
 
     private void restore() {
         SharedPreferences sp = getSharedPreferences(PREFS, MODE_PRIVATE);
-        pinInput.setText(sp.getString("pin", ""));
-        ipInput.setText(sp.getString("host", ""));
+        targetPin = sp.getString("pin", "");
+        targetHost = sp.getString("host", "");
+        pinInput.setText(targetPin);
+        ipInput.setText(targetHost);
         presetSpinner.setSelection(Math.max(0, sp.getInt("preset", 2)));
         // 存档记录的是「值」而不是下标：选项增删时下标含义会变，值不会
         fpsSpinner.setSelection(indexOf(FPS_VALUES, sp.getInt("fpsValue", 30)));
@@ -683,9 +723,19 @@ public final class CastActivity extends Activity {
     }
 
     private void persist() {
+        // 必须兜住 null：Activity 重建后这些字段可能还是空的，
+        // 直接写进去会把存档里的地址/配对码清掉
+        String host = targetHost;
+        if (host == null) {
+            host = ipInput == null ? "" : ipInput.getText().toString().trim();
+        }
+        String pin = targetPin;
+        if (pin == null) {
+            pin = pinInput == null ? "" : pinInput.getText().toString().trim();
+        }
         getSharedPreferences(PREFS, MODE_PRIVATE).edit()
-                .putString("pin", targetPin)
-                .putString("host", targetHost)
+                .putString("pin", pin)
+                .putString("host", host)
                 .putInt("preset", presetSpinner.getSelectedItemPosition())
                 .putInt("fpsValue", FPS_VALUES[Math.max(0, fpsSpinner.getSelectedItemPosition())])
                 .putInt("bitrateMbps", BITRATE_MBPS[Math.max(0,

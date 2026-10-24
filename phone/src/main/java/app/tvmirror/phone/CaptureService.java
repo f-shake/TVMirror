@@ -87,7 +87,17 @@ public final class CaptureService extends Service implements Sender.Listener {
     /** 屏幕是否处于熄灭/锁屏状态。锁屏时系统不再向虚拟屏送内容，看门狗不该误判为故障。 */
     private volatile boolean screenOff;
     /** 采集管线是否因为录屏权限被收回而暂停（TCP 会话仍然保持）。 */
-    private volatile boolean paused;
+    private static volatile boolean paused;
+    /** TCP 会话是否已经真正建立（握手完成）。界面据此区分「连接中」与「正在投屏」。 */
+    private static volatile boolean connected;
+
+    public static boolean isPaused() {
+        return paused;
+    }
+
+    public static boolean isConnected() {
+        return connected;
+    }
     private volatile String codecName = "avc";
     /** 保护 projection / encoder / audioEncoder 的替换，避免暂停与恢复互相踩。 */
     private final Object pipelineLock = new Object();
@@ -495,6 +505,7 @@ public final class CaptureService extends Service implements Sender.Listener {
                     sender = new Sender(targetHost, port, handshake, CaptureService.this);
                     try {
                         sender.connect();
+                        connected = true;
                     } catch (Sender.HandshakeFailure e) {
                         fail("电视拒绝连接：" + friendly(e.code));
                         return;
@@ -784,6 +795,8 @@ public final class CaptureService extends Service implements Sender.Listener {
     @Override
     public void onDestroy() {
         running = false;
+        connected = false;
+        paused = false;
         // 「投屏已暂停」通知必须随服务一起消失，否则会永久挂在通知栏
         cancelResumeNotification();
         if (watchdog != null) {
@@ -828,6 +841,7 @@ public final class CaptureService extends Service implements Sender.Listener {
 
     @Override
     public void onDisconnected(String reason) {
+        connected = false;
         Log.w(TAG, "会话断开: " + reason);
         lastError = "连接已断开：" + reason;
         stopSelf();
