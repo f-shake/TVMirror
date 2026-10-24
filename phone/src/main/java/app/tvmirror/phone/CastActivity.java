@@ -259,12 +259,15 @@ public final class CastActivity extends Activity {
             } else {
                 getWindow().clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
             }
+            // 投屏中整张「电视/搜索电视」卡片都不该占位，停止后再恢复
+            View card = findViewById(R.id.deviceCard);
+            if (card != null) {
+                card.setVisibility(running ? View.GONE : View.VISIBLE);
+            }
             // 连上之后要把「正在连接电视…」换掉，否则电视都出画面了还写着正在连接
             if (running && !casting) {
                 String host = targetHost == null || targetHost.isEmpty() ? "电视" : targetHost;
                 setStatus("正在投屏到 " + host);
-                // 电视卡片也不该继续写着「尚未搜索到电视」
-                deviceView.setText("已连接\n" + host);
             }
             // 错误既可能发生在结束时（断线），也可能发生在运行中（暂停/恢复失败），
             // 所以这里不区分运行状态，一律展示并清掉
@@ -277,8 +280,6 @@ public final class CastActivity extends Activity {
                     // 服务被系统回收/静默结束时没有 error，状态文案必须复位，
                     // 否则按钮已经变回「开始投屏」，文案却还写着「正在投屏到…」
                     setStatus("准备就绪");
-                    deviceView.setText(selected == null ? "尚未搜索到电视"
-                            : selected.name + "\n" + selected.host);
                 }
             }
             casting = running;
