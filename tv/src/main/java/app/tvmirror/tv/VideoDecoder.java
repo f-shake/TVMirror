@@ -197,6 +197,8 @@ public final class VideoDecoder implements Runnable {
                 continue;
             }
             if (frame.type == FrameType.VIDEO || frame.type == FrameType.CONFIG) {
+                // 码率必须按实际收到的码流字节统计，解码器输出的 info.size 不是码流大小
+                session.stats.onReceived(frame.payload.length);
                 int flags = frame.type == FrameType.CONFIG ? MediaCodec.BUFFER_FLAG_CODEC_CONFIG : 0;
                 feed(frame.payload, frame.ptsUs, flags);
                 drain(info);

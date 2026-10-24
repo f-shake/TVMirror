@@ -47,8 +47,9 @@ public final class StatsCollector {
             windowStartUs = nowUs;
         }
         framesInWindow++;
-        bytesInWindow += sizeBytes;
         totalFrames++;
+        // 注意：sizeBytes 是解码输出缓冲大小，不等于码流字节数，
+        // 码率只由 onReceived() 累加的真实帧负载计算。
 
         long decodeMs = (nowUs - arrivalUs) / 1000;
         if (decodeMs >= 0 && decodeMs < 5000) {
@@ -71,6 +72,11 @@ public final class StatsCollector {
             bytesInWindow = 0;
             windowStartUs = nowUs;
         }
+    }
+
+    /** 收到一个视频帧时调用，用负载长度统计真实码流码率。 */
+    public synchronized void onReceived(int payloadBytes) {
+        bytesInWindow += Math.max(0, payloadBytes);
     }
 
     public synchronized void onDropped() {
