@@ -215,22 +215,32 @@ public final class CaptureService extends Service implements Sender.Listener {
                         targetFps, targetBitrate, wantAudio, pin, Build.MODEL);
                 adaptive = new AdaptiveBitrate(preset, targetBitrate / 1000);
 
-                sender = new Sender(targetHost, port, handshake, CaptureService.this);
-                try {
-                    sender.connect();
-                } catch (Sender.HandshakeFailure e) {
-                    fail("电视拒绝连接：" + friendly(e.code));
-                    return;
-                } catch (Exception e) {
-                    fail("连不上电视：" + e.getMessage());
-                    return;
+                final boolean bench = getSharedPreferences("tvmirror_phone", MODE_PRIVATE)
+                        .getBoolean("bench", false);
+                if (!bench) {
+                    sender = new Sender(targetHost, port, handshake, CaptureService.this);
+                    try {
+                        sender.connect();
+                    } catch (Sender.HandshakeFailure e) {
+                        fail("电视拒绝连接：" + friendly(e.code));
+                        return;
+                    } catch (Exception e) {
+                        fail("连不上电视：" + e.getMessage());
+                        return;
+                    }
+                } else {
+                    Log.i(TAG, "基准模式：只采集与编码，不连接电视");
                 }
 
                 encoder = new ScreenEncoder(projection, new ScreenEncoder.Sink() {
                     @Override
                     public void onConfig(byte[] data, long ptsUs) {
+                        Sender s = sender;
+                        if (s == null) {
+                            return;
+                        }
                         try {
-                            sender.sendConfig(data, ptsUs);
+                            s.sendConfig(data, ptsUs);
                         } catch (Exception e) {
                             stopSelf();
                         }
@@ -238,8 +248,12 @@ public final class CaptureService extends Service implements Sender.Listener {
 
                     @Override
                     public void onVideo(byte[] data, long ptsUs) {
+                        Sender s = sender;
+                        if (s == null) {
+                            return;
+                        }
                         try {
-                            sender.sendVideo(data, ptsUs);
+                            s.sendVideo(data, ptsUs);
                         } catch (Exception e) {
                             stopSelf();
                         }
@@ -282,7 +296,8 @@ public final class CaptureService extends Service implements Sender.Listener {
                     audioEncoder.start();
                 }
 
-                updateNotification("正在投屏到 " + targetHost);
+                updateNotification(bench ? "基准模式：仅采集编码（不投屏）"
+                        : "正在投屏到 " + targetHost);
                 muteSourceAudio();
                 registerDisplayListener();
             }

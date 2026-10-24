@@ -85,6 +85,10 @@ public final class CastActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        // 调试用：`am start ... --ez bench true` 启动后，投屏只采集编码、不连电视，
+        // 便于在不动电视的情况下测量编码器实际输出。
+        boolean bench = getIntent().getBooleanExtra("bench", false);
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit().putBoolean("bench", bench).apply();
         setContentView(R.layout.activity_cast);
 
         statusView = findViewById(R.id.status);

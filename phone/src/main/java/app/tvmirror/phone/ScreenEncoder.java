@@ -49,9 +49,18 @@ public final class ScreenEncoder implements Runnable {
     private static final int CQ_QUALITY = 85;
     /** 用 AVC High profile 提升同码率下的画质。 */
     private static final boolean USE_HIGH_PROFILE = true;
+    /**
+     * 是否用 GL 节拍器限制出帧率。
+     *
+     * VirtualDisplay 会按面板刷新率（144Hz）推帧，而 KEY_MAX_FPS_TO_ENCODER 与
+     * Surface.setFrameRate 都管不住它。帧率过高会把码率预算摊薄，画面变糊，
+     * 所以中间插一层 GL 做帧率整形。失败时自动退回直连，不影响可用性。
+     */
+    private static final boolean USE_GL_PACING = true;
 
     private MediaCodec codecObject;
     private Surface inputSurface;
+    private GlFramePacer pacer;
     private VirtualDisplay display;
     private Thread thread;
     private volatile boolean running;
@@ -92,22 +101,40 @@ public final class ScreenEncoder implements Runnable {
                 return;
             }
             codecObject = createCodec(width, height);
+            Surface displaySurface = setupPacer(width, height);
             if (display == null) {
                 display = projection.createVirtualDisplay("TVMirror",
                         width, height, dpi,
                         DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-                        inputSurface, null, null);
+                        displaySurface, null, null);
             } else {
                 // 复用同一个 VirtualDisplay，避免触发「一个投影只能创建一次」的限制
-                display.setSurface(inputSurface);
+                display.setSurface(displaySurface);
                 display.resize(width, height, dpi);
             }
-            // 让虚拟屏按目标帧率出帧。120Hz 屏幕上不设这个，编码器会被灌到 120fps，
-            // 超出硬编能力后它会自己丢输入帧，参考链一断，运动区域就花屏。
             applyFrameRate();
             running = true;
             thread = new Thread(this, "tvmirror-encode");
             thread.start();
+        }
+    }
+
+    /** 建立 GL 节拍器并返回应当给 VirtualDisplay 用的 Surface。失败则退回直连。 */
+    private Surface setupPacer(int width, int height) {
+        if (!USE_GL_PACING) {
+            return inputSurface;
+        }
+        if (pacer != null) {
+            pacer.release();
+            pacer = null;
+        }
+        try {
+            pacer = GlFramePacer.create(inputSurface, width, height, fps);
+            return pacer.producerSurface();
+        } catch (Exception e) {
+            android.util.Log.w("TVMirror", "GL 节拍器不可用，退回直连: " + e.getMessage());
+            pacer = null;
+            return inputSurface;
         }
     }
 
@@ -141,8 +168,9 @@ public final class ScreenEncoder implements Runnable {
             }
 
             codecObject = createCodec(width, height);
+            Surface displaySurface = setupPacer(width, height);
             if (display != null) {
-                display.setSurface(inputSurface);
+                display.setSurface(displaySurface);
                 display.resize(width, height, dpi);
             }
             applyFrameRate();
@@ -171,6 +199,11 @@ public final class ScreenEncoder implements Runnable {
             if (display != null) {
                 display.release();
                 display = null;
+            }
+            // 先拆节拍器再释放编码器 Surface：它持有 EGLSurface，顺序反了会报 EGL 错误
+            if (pacer != null) {
+                pacer.release();
+                pacer = null;
             }
             if (codecObject != null) {
                 try {
@@ -208,14 +241,21 @@ public final class ScreenEncoder implements Runnable {
     }
 
     private void applyFrameRate() {
+        if (pacer != null) {
+            // 有节拍器时由它真正控制帧率，Surface 上的帧率提示已无意义
+            pacer.setFrameRate(fps);
+            return;
+        }
         if (inputSurface == null) {
             return;
         }
         try {
             // VirtualDisplay 在 API 34 上已没有公开的设帧率接口，改由输入 Surface 声明期望帧率。
             if (android.os.Build.VERSION.SDK_INT >= 30) {
+                // FIXED_SOURCE 表示「内容就是固定这个帧率」，比 DEFAULT 更强硬，
+                // 允许合成器按该帧率节流，而不是按面板刷新率（144Hz）铺满。
                 inputSurface.setFrameRate((float) fps,
-                        android.view.Surface.FRAME_RATE_COMPATIBILITY_DEFAULT);
+                        android.view.Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE);
             }
         } catch (RuntimeException ignored) {
             // 个别固件不支持该接口，退化为按屏幕刷新率出帧
