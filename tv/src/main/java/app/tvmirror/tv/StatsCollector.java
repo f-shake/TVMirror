@@ -27,6 +27,7 @@ public final class StatsCollector {
     /** 电视时钟 − 手机时钟（微秒）；由心跳算出，用于把帧时间戳换算到本地时钟。 */
     private long clockOffsetUs = Long.MIN_VALUE;
     private int endToEndMs;
+    private long lateFrames;
 
     public synchronized void setResolution(int width, int height) {
         this.width = width;
@@ -79,6 +80,18 @@ public final class StatsCollector {
         bytesInWindow += Math.max(0, payloadBytes);
     }
 
+    /**
+     * 记录一次「晚于计划时刻上屏」的事件。
+     *
+     * 卡顿的主观测感往往不是丢帧，而是上屏时刻不均匀：帧该在 A 时刻出现，
+     * 实际拖到 A+X 才出现。这个计数就是量化这件事。
+     */
+    public synchronized void onLate(long lateUs) {
+        if (lateUs > 20_000) {
+            lateFrames++;
+        }
+    }
+
     public synchronized void onDropped() {
         droppedFrames++;
     }
@@ -86,8 +99,9 @@ public final class StatsCollector {
     public synchronized String describe() {
         String resolution = width > 0 ? width + "x" + height : "--";
         return String.format(java.util.Locale.US,
-                "分辨率 %s   帧率 %.1f fps   码率 %.1f Mbps   端到端 %d ms   解码 %d ms   网络 %d ms   丢 %d",
-                resolution, fps, kbps / 1000f, endToEndMs, lastLatencyMs, rttMs, droppedFrames);
+                "分辨率 %s   帧率 %.1f fps   码率 %.1f Mbps   端到端 %d ms   解码 %d ms   网络 %d ms   丢 %d   晚 %d",
+                resolution, fps, kbps / 1000f, endToEndMs, lastLatencyMs, rttMs, droppedFrames,
+                lateFrames);
     }
 
     public synchronized float fps() {

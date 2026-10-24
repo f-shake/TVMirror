@@ -50,6 +50,10 @@ public final class VideoDecoder implements Runnable {
     private volatile boolean running = true;
     private volatile AudioSink audioSink;
     private Thread thread;
+    /** 专职负责按时上屏的线程。 */
+    private Thread presentThread;
+    /** 保护 pending 队列与 codec 释放动作：解码线程与上屏线程都会碰它。 */
+    private final Object presentLock = new Object();
     private MediaCodec codec;
     private boolean firstFrameSeen;
     /** 最近一次把帧送进解码器的时刻，用于统计「送入 → 上屏」的真实耗时。 */
@@ -110,12 +114,36 @@ public final class VideoDecoder implements Runnable {
     }
 
     public void start() {
+        // 上屏必须由独立线程按固定频率驱动。
+        // 之前只在「收到新帧」时顺便检查一次到期时刻，检查粒度等于帧间隔（~16.7ms），
+        // 该上屏的帧会被推迟到下一帧到达才显示，画面节奏因此忽快忽慢。
+        presentThread = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                while (running) {
+                    synchronized (presentLock) {
+                        releaseDueLocked();
+                    }
+                    try {
+                        Thread.sleep(2);
+                    } catch (InterruptedException e) {
+                        return;
+                    }
+                }
+            }
+        }, "tvmirror-present");
+        presentThread.start();
         thread = new Thread(this, "tvmirror-decode");
         thread.start();
     }
 
     public void stop() {
         running = false;
+        Thread p = presentThread;
+        presentThread = null;
+        if (p != null) {
+            p.interrupt();
+        }
         if (thread != null) {
             thread.interrupt();
             thread = null;
@@ -321,10 +349,9 @@ public final class VideoDecoder implements Runnable {
 
     private void drain(MediaCodec.BufferInfo info) {
         while (running) {
-            releaseDue();
+            // 上屏由 presentThread 负责，这里只负责解码与入队
             int out = codec.dequeueOutputBuffer(info, 0);
             if (out == MediaCodec.INFO_TRY_AGAIN_LATER) {
-                releaseDue();
                 return;
             }
             if (out == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
@@ -351,18 +378,20 @@ public final class VideoDecoder implements Runnable {
                 }
                 lastDueUs = dueUs;
                 Long captureUs = fedPts.pollFirst();
-                pending.addLast(new long[]{out, dueUs, info.size,
-                        captureUs == null ? -1 : captureUs});
-                // 缓冲太多说明呈现线程跟不上，放掉最旧的一帧，避免解码器被占满。
-                // 上限要随缓冲时长走：1 秒缓冲在 60fps 下需要容纳 60 帧。
-                while (pending.size() > maxPendingFrames()) {
-                    releaseOne();
+                synchronized (presentLock) {
+                    pending.addLast(new long[]{out, dueUs, info.size,
+                            captureUs == null ? -1 : captureUs});
+                    // 缓冲太多说明呈现线程跟不上，放掉最旧的一帧，避免解码器被占满
+                    while (pending.size() > maxPendingFrames()) {
+                        releaseOne();
+                    }
                 }
             }
         }
     }
 
-    private void releaseDue() {
+    /** 调用方必须持有 presentLock。 */
+    private void releaseDueLocked() {
         long nowUs = SystemClock.elapsedRealtimeNanos() / 1000;
         while (!pending.isEmpty() && pending.peekFirst()[1] <= nowUs) {
             releaseOne();
@@ -374,13 +403,14 @@ public final class VideoDecoder implements Runnable {
         if (item == null || codec == null) {
             return;
         }
+        long nowUs = SystemClock.elapsedRealtimeNanos() / 1000;
+        session.stats.onLate(nowUs - item[1]);
         try {
             codec.releaseOutputBuffer((int) item[0], true);
         } catch (RuntimeException e) {
             return;
         }
-        session.stats.onFrame((int) item[2], item[3], lastFeedUs,
-                SystemClock.elapsedRealtimeNanos() / 1000);
+        session.stats.onFrame((int) item[2], item[3], lastFeedUs, nowUs);
         if (!firstFrameSeen) {
             firstFrameSeen = true;
             android.util.Log.d("TVMirror", "首帧已渲染");
