@@ -372,6 +372,8 @@ public final class ScreenEncoder implements Runnable {
     @Override
     public void run() {
         MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
+        long statStartMs = android.os.SystemClock.elapsedRealtime();
+        int statFrames = 0;
         while (running) {
             MediaCodec c = codecObject;
             if (c == null) {
@@ -414,6 +416,7 @@ public final class ScreenEncoder implements Runnable {
                             long nanoToElapsedUs =
                                     (android.os.SystemClock.elapsedRealtimeNanos() - System.nanoTime()) / 1000;
                             sink.onVideo(data, info.presentationTimeUs + nanoToElapsedUs);
+                            statFrames++;
                         }
                     }
                 }
@@ -425,6 +428,14 @@ public final class ScreenEncoder implements Runnable {
                 } catch (RuntimeException ignored) {
                     // codec 已 stop/release，丢掉这个 index 即可
                 }
+            }
+            long nowMs = android.os.SystemClock.elapsedRealtime();
+            if (nowMs - statStartMs >= 5000) {
+                // 编码器实际吐出多少帧：与电视端「收」对比即可判断卡在编码还是链路
+                android.util.Log.d("TVMirror", "编码输出 " + (nowMs - statStartMs) + "ms: "
+                        + statFrames + " 帧 (" + (statFrames * 1000 / (nowMs - statStartMs)) + " fps)");
+                statStartMs = nowMs;
+                statFrames = 0;
             }
         }
     }
