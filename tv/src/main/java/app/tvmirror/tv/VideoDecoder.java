@@ -216,9 +216,9 @@ public final class VideoDecoder implements Runnable {
             try {
                 frame = session.readFrame();
             } catch (java.net.SocketTimeoutException e) {
-                // 15 秒没有任何帧（含每秒一次的 PING）→ 手机失联，主动收摊
+                // 长时间没有任何帧（含每秒一次的 PING）→ 手机可能被系统冻结或已掉线
                 if (running) {
-                    callback.onError("手机端已失联");
+                    callback.onError("手机端已失联（超过 2 分钟无任何数据）");
                 }
                 return;
             } catch (IOException e) {

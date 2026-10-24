@@ -211,9 +211,10 @@ public final class ReceiverService extends Service {
                     return;
                 }
                 respond(client, "{\"ok\":true,\"session\":1}");
-                // 手机会每秒发一次 PING；15 秒收不到任何帧就认为对端失联，
-                // 否则手机掉线后这条会话永远「忙」，新连接全被拒绝。
-                client.setSoTimeout(15000);
+                // 心跳是每秒一次，但手机锁屏后 MIUI 会冻结整个进程（连 wake lock 都被禁），
+                // 这时心跳也会停。判活窗口设宽一些：短暂锁屏不该导致断线，
+                // 醒来后心跳恢复，会话继续；真掉线（Wi-Fi 断、进程被杀）才收摊。
+                client.setSoTimeout(120_000);
                 Session session = new Session(client, handshake);
                 activeSession = session;
                 SessionHub.publish(session);
