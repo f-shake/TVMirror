@@ -78,6 +78,8 @@ public final class CastActivity extends Activity {
     private boolean casting;
     /** 接收端缓冲（毫秒）；0 表示用电视端默认的小缓冲。 */
     private int bufferMs;
+    /** 是否把声音一起投过去。 */
+    private boolean audioEnabled = true;
     /** 平板原生长边（例如 2880），「自动」优先用它。 */
     private int nativeLongSide = 1920;
     private boolean nativeSupported;
@@ -96,6 +98,11 @@ public final class CastActivity extends Activity {
         if (requestedBuffer >= 0) {
             getSharedPreferences(PREFS, MODE_PRIVATE).edit()
                     .putInt("bufferMs", requestedBuffer).apply();
+        }
+        // 调试用：`am start ... --ez audio false` 可关掉声音（默认投声音）
+        if (getIntent().hasExtra("audio")) {
+            getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+                    .putBoolean("audioEnabled", getIntent().getBooleanExtra("audio", true)).apply();
         }
         // 从「投屏已暂停」通知进来：立刻重新申请录屏权限，恢复原会话。
         // 注意必须在 setContentView 与 findViewById 之后再做，否则 statusView 还是 null。
@@ -251,6 +258,11 @@ public final class CastActivity extends Activity {
                 getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
             } else {
                 getWindow().clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+            }
+            // 连上之后要把「正在连接电视…」换掉，否则电视都出画面了还写着正在连接
+            if (running && !casting) {
+                setStatus("正在投屏到 " + (targetHost == null || targetHost.isEmpty()
+                        ? "电视" : targetHost));
             }
             // 错误既可能发生在结束时（断线），也可能发生在运行中（暂停/恢复失败），
             // 所以这里不区分运行状态，一律展示并清掉
@@ -570,7 +582,7 @@ public final class CastActivity extends Activity {
         intent.putExtra(CaptureService.EXTRA_PRESET,
                 Preset.values()[presetSpinner.getSelectedItemPosition()].id);
         intent.putExtra(CaptureService.EXTRA_CODEC, chosenCodec);
-        intent.putExtra(CaptureService.EXTRA_AUDIO, true);
+        intent.putExtra(CaptureService.EXTRA_AUDIO, audioEnabled);
         int longSide = effectiveLongSide();
         int effectiveFps = selectedFps();
         if (Handshake.CODEC_HEVC.equals(chosenCodec)) {
@@ -651,6 +663,7 @@ public final class CastActivity extends Activity {
         fpsSpinner.setSelection(indexOf(FPS_VALUES, sp.getInt("fpsValue", 30)));
         bitrateSpinner.setSelection(indexOf(BITRATE_MBPS, sp.getInt("bitrateMbps", 0)));
         bufferMs = sp.getInt("bufferMs", 0);
+        audioEnabled = sp.getBoolean("audioEnabled", true);
         resolutionSpinner.setSelection(
                 indexOf(RESOLUTION_LONG_SIDE, sp.getInt("resolutionLong", 0)));
     }
