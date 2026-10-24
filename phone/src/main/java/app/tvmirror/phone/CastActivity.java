@@ -76,6 +76,8 @@ public final class CastActivity extends Activity {
     private int deviceMaxFps = 60;
     /** 上一次轮询时是否处于投屏状态，用来判断「刚结束」并复位状态文案。 */
     private boolean casting;
+    /** 接收端缓冲（毫秒）；0 表示用电视端默认的小缓冲。 */
+    private int bufferMs;
     /** 平板原生长边（例如 2880），「自动」优先用它。 */
     private int nativeLongSide = 1920;
     private boolean nativeSupported;
@@ -89,6 +91,12 @@ public final class CastActivity extends Activity {
         // 便于在不动电视的情况下测量编码器实际输出。
         boolean bench = getIntent().getBooleanExtra("bench", false);
         getSharedPreferences(PREFS, MODE_PRIVATE).edit().putBoolean("bench", bench).apply();
+        // 调试用：`am start ... --ei bufferMs 1000` 可设定电视端缓冲（毫秒），验证抖动与延迟的取舍
+        int requestedBuffer = getIntent().getIntExtra("bufferMs", -1);
+        if (requestedBuffer >= 0) {
+            getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+                    .putInt("bufferMs", requestedBuffer).apply();
+        }
         setContentView(R.layout.activity_cast);
 
         statusView = findViewById(R.id.status);
@@ -525,6 +533,8 @@ public final class CastActivity extends Activity {
         intent.putExtra(CaptureService.EXTRA_MAX_LONG_SIDE, longSide);
         intent.putExtra(CaptureService.EXTRA_FPS, effectiveFps);
         intent.putExtra(CaptureService.EXTRA_BITRATE, selectedBitrate());
+        // 缓冲是握手参数，只能在建立会话时生效，投屏中改不了
+        intent.putExtra(CaptureService.EXTRA_BUFFER_MS, bufferMs);
         startForegroundService(intent);
 
         setStatus("正在连接电视…");
@@ -591,6 +601,7 @@ public final class CastActivity extends Activity {
         // 存档记录的是「值」而不是下标：选项增删时下标含义会变，值不会
         fpsSpinner.setSelection(indexOf(FPS_VALUES, sp.getInt("fpsValue", 30)));
         bitrateSpinner.setSelection(indexOf(BITRATE_MBPS, sp.getInt("bitrateMbps", 0)));
+        bufferMs = sp.getInt("bufferMs", 0);
         resolutionSpinner.setSelection(
                 indexOf(RESOLUTION_LONG_SIDE, sp.getInt("resolutionLong", 0)));
     }

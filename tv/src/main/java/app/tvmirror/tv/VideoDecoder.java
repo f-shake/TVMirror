@@ -62,11 +62,38 @@ public final class VideoDecoder implements Runnable {
      * 这里把视频压后同样的时长，让两条链路的呈现时刻对齐。
      */
     private static final long PRESENTATION_DELAY_US = 24_000;
-
+    /** 默认缓冲可容纳的帧数；实际上限按缓冲时长与帧率换算。 */
+    private static final int MIN_PENDING_FRAMES = 6;
     /** 已解码但还没到呈现时刻的帧：{bufferIndex, 到期时刻us, 字节数, 手机出帧时刻us}。 */
     private final java.util.ArrayDeque<long[]> pending = new java.util.ArrayDeque<>();
     /** 按送入顺序记录视频帧的手机时间戳，输出时按同序取用。 */
     private final java.util.ArrayDeque<Long> fedPts = new java.util.ArrayDeque<>();
+
+    /** 上一帧排定的呈现时刻（微秒），用来把输出排成等间隔。 */
+    private long lastDueUs;
+    /** 手机在握手时指定的缓冲时长（微秒）；0 表示用默认小缓冲。 */
+    private final long bufferDelayUs;
+
+    private long presentationDelayUs() {
+        return bufferDelayUs > 0 ? bufferDelayUs : PRESENTATION_DELAY_US;
+    }
+
+    /**
+     * 待呈现队列的上限：缓冲时长 × 帧率 × 1.5。
+     *
+     * 1.5 倍是给稳态抖动留的余量——队列平时就停在「延迟 × 帧率」附近，
+     * 上限贴着这个数会持续丢最旧的帧、打断参考链（表现为花屏）。
+     *
+     * 注意：这个队列持有的是**解码后的输出 buffer**，数量受解码器实例限制
+     * （通常只有一二十个），所以缓冲时长本身不能设得太大，否则解码器会被我们卡住。
+     */
+    private int maxPendingFrames() {
+        long delayUs = presentationDelayUs();
+        int fps = Math.max(24, session.handshake == null ? 60 : session.handshake.fps);
+        long buffered = delayUs * fps / 1_000_000L;
+        long needed = buffered * 3 / 2;
+        return (int) Math.max(MIN_PENDING_FRAMES, Math.min(120, needed));
+    }
 
     public VideoDecoder(Surface surface, Session session, Callback callback) {
         this.surface = surface;
@@ -75,6 +102,7 @@ public final class VideoDecoder implements Runnable {
         this.mime = app.tvmirror.protocol.CodecMime.mimeOf(session.handshake.codec);
         this.width = session.handshake.width;
         this.height = session.handshake.height;
+        this.bufferDelayUs = (long) session.handshake.bufferMs * 1000L;
     }
 
     public void setAudioSink(AudioSink sink) {
@@ -307,12 +335,27 @@ public final class VideoDecoder implements Runnable {
                     codec.releaseOutputBuffer(out, false);
                     continue;
                 }
-                long dueUs = SystemClock.elapsedRealtimeNanos() / 1000 + PRESENTATION_DELAY_US;
+                // 等间隔上屏：不是「解码完 + 固定延迟」，而是按帧间隔顺延。
+                // 后者会把网络抖动原样传到屏幕上（到得早早就早显示、晚就晚显示），
+                // 看起来就是「没丢帧但一顿一顿」。
+                long nowUs = SystemClock.elapsedRealtimeNanos() / 1000;
+                long intervalUs = 1_000_000L / Math.max(24,
+                        session.handshake == null ? 60 : session.handshake.fps);
+                long minDueUs = nowUs + presentationDelayUs();
+                long dueUs = lastDueUs == 0
+                        ? minDueUs
+                        : Math.max(minDueUs, lastDueUs + intervalUs);
+                // 长时间停顿后不要一路追赶，直接以当前时间为基点
+                if (dueUs - nowUs > presentationDelayUs() * 4) {
+                    dueUs = minDueUs;
+                }
+                lastDueUs = dueUs;
                 Long captureUs = fedPts.pollFirst();
                 pending.addLast(new long[]{out, dueUs, info.size,
                         captureUs == null ? -1 : captureUs});
-                // 缓冲太多说明呈现线程跟不上，放掉最旧的一帧，避免解码器被占满
-                while (pending.size() > 6) {
+                // 缓冲太多说明呈现线程跟不上，放掉最旧的一帧，避免解码器被占满。
+                // 上限要随缓冲时长走：1 秒缓冲在 60fps 下需要容纳 60 帧。
+                while (pending.size() > maxPendingFrames()) {
                     releaseOne();
                 }
             }

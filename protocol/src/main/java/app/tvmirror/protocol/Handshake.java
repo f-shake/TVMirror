@@ -25,6 +25,8 @@ public final class Handshake {
     private static final int MIN_BITRATE = 500_000;
     private static final int MAX_BITRATE = 25_000_000;
     private static final int MAX_NAME = 64;
+    /** 接收端缓冲上限（毫秒）。超过 2 秒对交互投屏已无意义。 */
+    private static final int MAX_BUFFER_MS = 2000;
 
     public final String codec;
     public final String preset;
@@ -32,18 +34,30 @@ public final class Handshake {
     public final int height;
     public final int fps;
     public final int bitrate;
+    /**
+     * 接收端呈现前的缓冲（毫秒）。0 表示用默认的小缓冲。
+     *
+     * 缓冲越大越抗抖动（画面节奏更稳），代价是端到端延迟同步增加。
+     */
+    public final int bufferMs;
     public final boolean audio;
     public final String pin;
     public final String name;
 
     public Handshake(String codec, String preset, int width, int height, int fps,
                      int bitrate, boolean audio, String pin, String name) {
+        this(codec, preset, width, height, fps, bitrate, 0, audio, pin, name);
+    }
+
+    public Handshake(String codec, String preset, int width, int height, int fps,
+                     int bitrate, int bufferMs, boolean audio, String pin, String name) {
         this.codec = codec == null ? CODEC_AVC : codec;
         this.preset = preset == null ? Preset.LATENCY.id : preset;
         this.width = width <= 0 ? 1920 : width;
         this.height = height <= 0 ? 1080 : height;
         this.fps = fps <= 0 ? 60 : fps;
         this.bitrate = bitrate <= 0 ? 12_000_000 : bitrate;
+        this.bufferMs = Math.max(0, Math.min(MAX_BUFFER_MS, bufferMs));
         this.audio = audio;
         this.pin = pin;
         this.name = name == null ? "Android" : name;
@@ -74,6 +88,7 @@ public final class Handshake {
                 .append(Json.quote("height")).append(':').append(height).append(',')
                 .append(Json.quote("fps")).append(':').append(fps).append(',')
                 .append(Json.quote("bitrate")).append(':').append(bitrate).append(',')
+                .append(Json.quote("bufferMs")).append(':').append(bufferMs).append(',')
                 .append(Json.quote("audio")).append(':').append(audio).append(',')
                 .append(Json.quote("pin")).append(':').append(pin == null ? "null" : Json.quote(pin)).append(',')
                 .append(Json.quote("name")).append(':').append(Json.quote(name))
@@ -120,10 +135,15 @@ public final class Handshake {
         if (bitrateL < MIN_BITRATE || bitrateL > MAX_BITRATE) {
             throw new ParseException("range", "码率非法: " + bitrateL);
         }
+        long bufferMsL = asLong(m, "bufferMs", 0);
+        if (bufferMsL < 0 || bufferMsL > MAX_BUFFER_MS) {
+            throw new ParseException("range", "缓冲参数非法: " + bufferMsL);
+        }
         int width = (int) widthL;
         int height = (int) heightL;
         int fps = (int) fpsL;
         int bitrate = (int) bitrateL;
+        int bufferMs = (int) bufferMsL;
 
         String pin = asNullableString(m, "pin");
         if (pin != null && !pin.matches("\\d{4}")) {
@@ -136,7 +156,8 @@ public final class Handshake {
         }
 
         boolean audio = asBoolean(m, "audio", false);
-        return new Handshake(codec, preset, width, height, fps, bitrate, audio, pin, name);
+        return new Handshake(codec, preset, width, height, fps, bitrate, bufferMs,
+                audio, pin, name);
     }
 
     private static long asLong(Map<String, Object> m, String key, long def) throws ParseException {

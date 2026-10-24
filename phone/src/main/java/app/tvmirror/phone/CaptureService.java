@@ -45,6 +45,8 @@ public final class CaptureService extends Service implements Sender.Listener {
     public static final String EXTRA_MAX_LONG_SIDE = "maxLongSide";
     public static final String EXTRA_FPS = "fps";
     public static final String EXTRA_BITRATE = "bitrate";
+    /** 接收端缓冲（毫秒）：越大越抗抖动，端到端延迟同步增加。 */
+    public static final String EXTRA_BUFFER_MS = "bufferMs";
 
     private static final String TAG = "TVMirror";
     private static final String CHANNEL_ID = "tvmirror_cast";
@@ -83,6 +85,8 @@ public final class CaptureService extends Service implements Sender.Listener {
     private volatile int maxLongSide = 1920;
     private volatile int targetFps = 60;
     private volatile int targetBitrate;
+    /** 接收端缓冲（毫秒），0 表示用电视端默认的小缓冲。 */
+    private volatile int bufferMs;
 
     @Override
     public void onCreate() {
@@ -119,6 +123,7 @@ public final class CaptureService extends Service implements Sender.Listener {
         maxLongSide = intent.getIntExtra(EXTRA_MAX_LONG_SIDE, preset.width);
         targetFps = intent.getIntExtra(EXTRA_FPS, preset.fps);
         targetBitrate = intent.getIntExtra(EXTRA_BITRATE, preset.bitrateBps);
+        bufferMs = intent.getIntExtra(EXTRA_BUFFER_MS, 0);
         boolean wantAudio = intent.getBooleanExtra(EXTRA_AUDIO, true)
                 && checkSelfPermission(android.Manifest.permission.RECORD_AUDIO)
                 == PackageManager.PERMISSION_GRANTED;
@@ -212,7 +217,7 @@ public final class CaptureService extends Service implements Sender.Listener {
             public void run() {
                 int[] size = computeSize();
                 Handshake handshake = new Handshake(codec, preset.id, size[0], size[1],
-                        targetFps, targetBitrate, wantAudio, pin, Build.MODEL);
+                        targetFps, targetBitrate, bufferMs, wantAudio, pin, Build.MODEL);
                 adaptive = new AdaptiveBitrate(preset, targetBitrate / 1000);
 
                 final boolean bench = getSharedPreferences("tvmirror_phone", MODE_PRIVATE)
