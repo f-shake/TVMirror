@@ -89,6 +89,12 @@ public final class CaptureService extends Service implements Sender.Listener {
     /** 采集管线是否因为录屏权限被收回而暂停（TCP 会话仍然保持）。 */
     private volatile boolean paused;
     private volatile String codecName = "avc";
+    /** 保护 projection / encoder / audioEncoder 的替换，避免暂停与恢复互相踩。 */
+    private final Object pipelineLock = new Object();
+    /** 本次会话是否需要投声音；恢复采集时要据此重建音频。 */
+    private volatile boolean wantAudioSession;
+    /** 「投屏已暂停」通知的 id（与前台服务通知分开，便于单独撤销）。 */
+    private static final int RESUME_NOTIFICATION_ID = NOTIFICATION_ID + 1;
     private volatile Preset preset;
     private String targetHost = "";
     private volatile AdaptiveBitrate adaptive;
@@ -179,31 +185,53 @@ public final class CaptureService extends Service implements Sender.Listener {
      * 只重建采集管线即可继续投，不用重新配对、重新连接。
      */
     private void pauseCasting(String reason) {
-        if (!running) {
+        if (!running || paused) {
             return;
         }
         paused = true;
-        ScreenEncoder enc = encoder;
-        encoder = null;
-        if (enc != null) {
-            try {
-                enc.stop();
-            } catch (RuntimeException ignored) {
-                // 投影已被系统终止，释放可能失败
-            }
-        }
-        MediaProjection p = projection;
-        projection = null;
-        if (p != null) {
-            try {
-                p.stop();
-            } catch (RuntimeException ignored) {
-                // 已经被系统停止了
-            }
-        }
         lastError = reason + "，点按恢复投屏";
         updateNotification("投屏已暂停：" + reason);
         postResumeNotification(reason);
+
+        // 拆除编码器要 join 线程、释放 codec、销毁 EGL，最长可阻塞近 2 秒。
+        // onStop 回调是主线程，绝不能在这里同步做，否则锁屏瞬间就是 ANR。
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                ScreenEncoder enc;
+                AudioEncoder aud;
+                MediaProjection p;
+                synchronized (pipelineLock) {
+                    enc = encoder;
+                    encoder = null;
+                    aud = audioEncoder;
+                    audioEncoder = null;
+                    p = projection;
+                    projection = null;
+                }
+                if (enc != null) {
+                    try {
+                        enc.stop();
+                    } catch (RuntimeException ignored) {
+                        // 投影已被系统终止，释放可能失败
+                    }
+                }
+                if (aud != null) {
+                    try {
+                        aud.stop();
+                    } catch (RuntimeException ignored) {
+                        // 同上
+                    }
+                }
+                if (p != null) {
+                    try {
+                        p.stop();
+                    } catch (RuntimeException ignored) {
+                        // 已经被系统停止了
+                    }
+                }
+            }
+        }, "tvmirror-pause").start();
     }
 
     /** 补一条可点按的通知：锁屏时用户也能看到并直接恢复。 */
@@ -225,15 +253,29 @@ public final class CaptureService extends Service implements Sender.Listener {
                 .setContentText(reason + "，点按恢复")
                 .setSmallIcon(R.drawable.ic_launcher)
                 .setContentIntent(pi)
-                .setAutoCancel(true)
-                .setOngoing(true)
+                // 不能设 ongoing：ongoing 通知无法点击清除，恢复后也没法自然消失
                 .build();
-        nm.notify(NOTIFICATION_ID + 1, n);
+        nm.notify(RESUME_NOTIFICATION_ID, n);
+    }
+
+    /** 恢复成功或服务停止时，把「已暂停」通知撤掉，避免永久挂在通知栏。 */
+    private void cancelResumeNotification() {
+        android.app.NotificationManager nm =
+                (android.app.NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+        if (nm != null) {
+            nm.cancel(RESUME_NOTIFICATION_ID);
+        }
     }
 
     /** 重新拿到录屏授权：只重建采集管线，沿用现有会话。 */
     private void resumeCasting(final int resultCode, final Intent resultData) {
         if (resultData == null || !running) {
+            return;
+        }
+        if (!paused) {
+            // 会话没在暂停态（正常运行时又收到一次 RESUME），忽略即可，
+            // 否则会建出第二个编码器，两个编码器往同一 Sender 写，码流立刻互相打架
+            Log.i(TAG, "当前不在暂停态，忽略恢复请求");
             return;
         }
         new Thread(new Runnable() {
@@ -244,7 +286,9 @@ public final class CaptureService extends Service implements Sender.Listener {
                             (MediaProjectionManager) getSystemService(MEDIA_PROJECTION_SERVICE);
                     MediaProjection fresh = manager.getMediaProjection(resultCode, resultData);
                     if (fresh == null) {
-                        lastError = "恢复失败：没有拿到录屏授权";
+                        // 必须显式失败：否则 paused 停住、encoder 为 null，
+                        // 界面仍显示在投，电视停在最后一帧，永远等不到结果
+                        fail("恢复失败：没有拿到录屏授权，请重新开始投屏");
                         return;
                     }
                     fresh.registerCallback(new MediaProjection.Callback() {
@@ -253,25 +297,46 @@ public final class CaptureService extends Service implements Sender.Listener {
                             pauseCasting("系统收回录屏权限（锁屏或被其他录屏占用）");
                         }
                     }, null);
-                    projection = fresh;
-                    paused = false;
+
                     int[] size = computeSize();
-                    ScreenEncoder enc = new ScreenEncoder(projection, createSink(), codecName,
+                    ScreenEncoder enc = new ScreenEncoder(fresh, createSink(), codecName,
                             targetFps, targetBitrate, preset.iFrameSeconds,
                             preset == Preset.QUALITY);
                     enc.start(size[0], size[1], size[2]);
-                    encoder = enc;
+
+                    synchronized (pipelineLock) {
+                        MediaProjection previous = projection;
+                        projection = fresh;
+                        encoder = enc;
+                        if (previous != null) {
+                            try {
+                                previous.stop();
+                            } catch (RuntimeException ignored) {
+                                // 已经被系统停止
+                            }
+                        }
+                    }
+                    paused = false;
+                    lastError = null;
+                    cancelResumeNotification();
+                    updateNotification("正在投屏到 " + targetHost);
+
+                    // 音频必须一起重建：旧的 AudioEncoder 绑在已被 stop 的投影上，
+                    // 不重建就会永久静音
+                    if (wantAudioSession) {
+                        AudioEncoder aud = new AudioEncoder(projection, createAudioSink());
+                        aud.start();
+                        audioEncoder = aud;
+                    }
+
                     Sender s = sender;
                     if (s != null) {
                         s.sendFormat(size[0], size[1]);
                     }
-                    lastError = null;
-                    updateNotification("正在投屏到 " + targetHost);
                     startWatchdog();
                     Log.i(TAG, "采集管线已恢复");
                 } catch (Exception e) {
-                    lastError = "恢复失败：" + e.getMessage();
-                    Log.w(TAG, "恢复失败: " + e.getMessage());
+                    fail("恢复失败：" + e.getMessage());
                 }
             }
         }, "tvmirror-resume").start();
@@ -333,7 +398,36 @@ public final class CaptureService extends Service implements Sender.Listener {
         }, "tvmirror-update").start();
     }
 
-    /** 采集输出 → 会话发送。恢复时也要用同一份，所以抽出来。 */
+    /** 音频采集输出 → 会话发送。首次与恢复时共用，避免两处各写一份。 */
+    private AudioEncoder.Sink createAudioSink() {
+        return new AudioEncoder.Sink() {
+            @Override
+            public void onAudio(byte[] data, long ptsUs) {
+                Sender s = sender;
+                if (s == null) {
+                    return;
+                }
+                s.sendAudio(data, ptsUs);
+            }
+
+            @Override
+            public void onAudioConfig(byte[] csd) {
+                // 当前是 PCM 直传，AudioEncoder 不会调用这里；
+                // 保留这条路径只为兼容旧的 AAC 协议帧，实际不可达。
+                try {
+                    Sender s = sender;
+                    if (s != null) {
+                        s.sendAudioConfig(csd);
+                    }
+                } catch (Exception ignored) {
+                    // 同上
+                }
+            }
+        };
+    }
+
+    /**
+     * 采集输出 → 会话发送。恢复时也要用同一份，所以抽出来。 */
     private ScreenEncoder.Sink createSink() {
         return new ScreenEncoder.Sink() {
             @Override
@@ -423,31 +517,9 @@ public final class CaptureService extends Service implements Sender.Listener {
                     return;
                 }
 
+                wantAudioSession = wantAudio;
                 if (wantAudio) {
-                    audioEncoder = new AudioEncoder(projection, new AudioEncoder.Sink() {
-                        @Override
-                        public void onAudio(byte[] data, long ptsUs) {
-                            Sender s = sender;
-                            if (s == null) {
-                                return;
-                            }
-                            s.sendAudio(data, ptsUs);
-                        }
-
-                        @Override
-                        public void onAudioConfig(byte[] csd) {
-                            // 当前是 PCM 直传，AudioEncoder 不会调用这里；
-                            // 保留这条路径只为兼容旧的 AAC 协议帧，实际不可达。
-                            try {
-                                Sender s = sender;
-                                if (s != null) {
-                                    s.sendAudioConfig(csd);
-                                }
-                            } catch (Exception ignored) {
-                                // 同上
-                            }
-                        }
-                    });
+                    audioEncoder = new AudioEncoder(projection, createAudioSink());
                     audioEncoder.start();
                 }
 
@@ -470,9 +542,15 @@ public final class CaptureService extends Service implements Sender.Listener {
      * 这里先尝试重建一次编码器；仍无输出就明确失败，让用户重新开始，而不是干等。
      */
     private void startWatchdog() {
+        // 恢复时会再次调用这里；若已有存活线程就直接复用，
+        // 否则两个看门狗共享 recovering 会互相误杀（一个在重建，另一个把它判死）
+        if (watchdog != null && watchdog.isAlive()) {
+            return;
+        }
         watchdog = new Thread(new Runnable() {
             @Override
             public void run() {
+                long noEncoderSinceMs = 0;
                 while (running) {
                     try {
                         Thread.sleep(2000);
@@ -484,6 +562,7 @@ public final class CaptureService extends Service implements Sender.Listener {
                     }
                     if (paused) {
                         recovering = false;
+                        noEncoderSinceMs = 0;
                         continue;
                     }
                     // 息屏瞬间广播可能还没到，先直接问电源状态：
@@ -496,14 +575,22 @@ public final class CaptureService extends Service implements Sender.Listener {
                     }
                     ScreenEncoder enc = encoder;
                     if (enc == null) {
+                        // 暂停后恢复失败会留下「running 但没采集」的僵尸会话，
+                        // 这里兜底：持续 10 秒没有编码器就明确失败，不能让界面一直显示在投
+                        long now = android.os.SystemClock.elapsedRealtime();
+                        if (noEncoderSinceMs == 0) {
+                            noEncoderSinceMs = now;
+                        } else if (now - noEncoderSinceMs > 10000) {
+                            fail("采集未启动（恢复失败），请重新开始投屏");
+                            return;
+                        }
                         continue;
                     }
-                    long last = enc.lastOutputElapsedMs();
-                    long idle = android.os.SystemClock.elapsedRealtime()
-                            - (last == 0 ? android.os.SystemClock.elapsedRealtime() : last);
-                    if (last == 0) {
-                        continue;
-                    }
+                    noEncoderSinceMs = 0;
+                    // 用 lastActivityElapsedMs：还没出过帧时退回启动时刻，
+                    // 这样「首帧之前 GL 线程就挂了」的死局也能被捕捉到
+                    long last = enc.lastActivityElapsedMs();
+                    long idle = android.os.SystemClock.elapsedRealtime() - last;
                     if (idle < 4000) {
                         recovering = false;
                         continue;
@@ -697,6 +784,8 @@ public final class CaptureService extends Service implements Sender.Listener {
     @Override
     public void onDestroy() {
         running = false;
+        // 「投屏已暂停」通知必须随服务一起消失，否则会永久挂在通知栏
+        cancelResumeNotification();
         if (watchdog != null) {
             watchdog.interrupt();
             watchdog = null;

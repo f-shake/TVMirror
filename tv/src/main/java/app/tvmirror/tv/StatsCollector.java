@@ -122,7 +122,12 @@ public final class StatsCollector {
                 stalledHint());
     }
 
-    /** 源画面停了就明确写出来：会话还活着但收不到帧，画面会冻在最后一帧。 */
+    /**
+     * 源画面停了就明确写出来：会话还活着但收不到帧，画面会冻在最后一帧。
+     *
+     * 只描述现象不猜原因——可能是手机锁屏、录屏授权被收回，
+     * 也可能是编码线程挂了或链路拥塞，猜错方向比不说更糟。
+     */
     private String stalledHint() {
         if (lastVideoMs == 0) {
             return "";
@@ -131,7 +136,7 @@ public final class StatsCollector {
         if (idle < 5000) {
             return "";
         }
-        return "   ⚠ 源画面已停止 " + (idle / 1000) + "s（手机锁屏或授权被收回，等待恢复）";
+        return "   ⚠ 已 " + (idle / 1000) + "s 未收到画面";
     }
 
     public synchronized float fps() {

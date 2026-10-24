@@ -123,8 +123,13 @@ public final class VideoDecoder implements Runnable {
             @Override
             public void run() {
                 while (running) {
-                    synchronized (presentLock) {
-                        releaseDueLocked();
+                    try {
+                        synchronized (presentLock) {
+                            releaseDueLocked();
+                        }
+                    } catch (RuntimeException e) {
+                        // 上屏线程不能静默死掉：一旦死了，画面节奏就彻底失控且无任何提示
+                        android.util.Log.w("TVMirror", "上屏异常: " + e.getMessage());
                     }
                     try {
                         Thread.sleep(2);
@@ -199,10 +204,13 @@ public final class VideoDecoder implements Runnable {
             height = newH;
             // 旧解码器已出队但未释放的 buffer index 在新解码器上无效，
             // 残留的 PTS 也会让端到端统计错位，必须一起清空。
-            pending.clear();
-            fedPts.clear();
-            releaseCodec();
-            openCodec();
+            // 必须持 presentLock：上屏线程正在同一个队列上取帧。
+            synchronized (presentLock) {
+                pending.clear();
+                fedPts.clear();
+                releaseCodec();
+                openCodec();
+            }
             callback.onFormatChanged(width, height);
         } catch (Exception e) {
             // 格式帧损坏时保持原尺寸继续解码，比直接断开体验好
@@ -333,8 +341,13 @@ public final class VideoDecoder implements Runnable {
             if (flags == MediaCodec.BUFFER_FLAG_CODEC_CONFIG) {
                 android.util.Log.d("TVMirror", "已送入配置帧 " + payload.length + " 字节");
             } else {
-                // 按送入顺序记录手机出帧时刻，输出时同序取出算端到端
+                // 按送入顺序记录手机出帧时刻，输出时同序取出算端到端。
+                // 队列必须有上限：一旦与输出不再一一对应（解码器丢帧/补帧），
+                // 它会永久错位且无限增长，端到端与缓冲都会失真。
                 fedPts.addLast(ptsUs);
+                while (fedPts.size() > 240) {
+                    fedPts.pollFirst();
+                }
             }
         } catch (RuntimeException e) {
             android.util.Log.e("TVMirror", "送入帧失败 size=" + payload.length + " flags=" + flags, e);
@@ -407,7 +420,11 @@ public final class VideoDecoder implements Runnable {
     /** 调用方必须持有 presentLock。 */
     private void releaseDueLocked() {
         long nowUs = SystemClock.elapsedRealtimeNanos() / 1000;
-        while (!pending.isEmpty() && pending.peekFirst()[1] <= nowUs) {
+        while (!pending.isEmpty()) {
+            long[] head = pending.peekFirst();
+            if (head == null || head[1] > nowUs) {
+                return;
+            }
             releaseOne();
         }
     }

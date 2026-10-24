@@ -263,12 +263,18 @@ final class GlFramePacer implements SurfaceTexture.OnFrameAvailableListener, Run
         renderThread = null;
         if (t != null) {
             try {
-                t.join(1000);
+                t.join(1500);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             }
+            if (t.isAlive()) {
+                // 线程可能还卡在 updateTexImage/eglSwapBuffers 里。
+                // 这时跨线程销毁 EGLSurface/SurfaceTexture 会造成 use-after-free（原生崩溃），
+                // 宁可让它自己退出时清理，也不要强拆。
+                Log.w(TAG, "节拍器线程未退出，跳过强制清理");
+                return;
+            }
         }
-        // 兜底：线程若没能自己清理（比如卡在 updateTexImage），这里再收一次
         cleanupGl();
     }
 

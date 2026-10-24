@@ -97,16 +97,8 @@ public final class CastActivity extends Activity {
             getSharedPreferences(PREFS, MODE_PRIVATE).edit()
                     .putInt("bufferMs", requestedBuffer).apply();
         }
-        // 从「投屏已暂停」通知进来：立刻重新申请录屏权限，恢复原会话
-        if (getIntent().getBooleanExtra("resume", false) && CaptureService.isRunning()) {
-            setStatus("投屏已暂停，正在重新申请录屏权限…");
-            handler.post(new Runnable() {
-                @Override
-                public void run() {
-                    launchProjection();
-                }
-            });
-        }
+        // 从「投屏已暂停」通知进来：立刻重新申请录屏权限，恢复原会话。
+        // 注意必须在 setContentView 与 findViewById 之后再做，否则 statusView 还是 null。
         setContentView(R.layout.activity_cast);
 
         statusView = findViewById(R.id.status);
@@ -161,6 +153,35 @@ public final class CastActivity extends Activity {
         resolutionSpinner.setOnItemSelectedListener(liveUpdate);
         fpsSpinner.setOnItemSelectedListener(liveUpdate);
         bitrateSpinner.setOnItemSelectedListener(liveUpdate);
+
+        // 视图都就绪后再处理「从暂停通知进入」：此时 setStatus 才安全
+        maybeHandleResumeIntent();
+    }
+
+    /**
+     * 点「投屏已暂停」通知进来时要重新申请录屏权限。
+     *
+     * 必须同时覆盖 onCreate 与 onNewIntent：通知用的是 SINGLE_TOP，
+     * 实例通常already存在，只会走 onNewIntent（之前漏了这条路径，点通知毫无反应）。
+     */
+    private void maybeHandleResumeIntent() {
+        if (!getIntent().getBooleanExtra("resume", false) || !CaptureService.isRunning()) {
+            return;
+        }
+        setStatus("投屏已暂停，正在重新申请录屏权限…");
+        handler.post(new Runnable() {
+            @Override
+            public void run() {
+                launchProjection();
+            }
+        });
+    }
+
+    @Override
+    protected void onNewIntent(android.content.Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        maybeHandleResumeIntent();
     }
 
     /** 投屏中改参数立刻生效；没在投屏时什么都不做（setSelection 也会触发回调）。 */
@@ -231,20 +252,20 @@ public final class CastActivity extends Activity {
             } else {
                 getWindow().clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
             }
-            if (!running) {
-                String error = CaptureService.lastError();
-                if (error != null) {
-                    setErrorStatus(error);
-                    CaptureService.clearError();
-                } else if (casting) {
+            // 错误既可能发生在结束时（断线），也可能发生在运行中（暂停/恢复失败），
+            // 所以这里不区分运行状态，一律展示并清掉
+            String error = CaptureService.lastError();
+            if (error != null) {
+                setErrorStatus(error);
+                CaptureService.clearError();
+            } else if (!running) {
+                if (casting) {
                     // 服务被系统回收/静默结束时没有 error，状态文案必须复位，
                     // 否则按钮已经变回「开始投屏」，文案却还写着「正在投屏到…」
                     setStatus("准备就绪");
                 }
-                casting = false;
-            } else {
-                casting = true;
             }
+            casting = running;
             handler.postDelayed(this, 500);
         }
     };

@@ -66,6 +66,8 @@ public final class ScreenEncoder implements Runnable {
     private volatile boolean running;
     /** 最近一次产出编码帧的时刻（毫秒），用于判断画面是否已经静止。 */
     private volatile long lastOutputMs;
+    /** 编码器（重）启动的时刻，供看门狗判断「一直没出过帧」。 */
+    private volatile long startedAtMs;
     /** 本次静止期是否已经补过关键帧，避免静止时反复刷 IDR。 */
     private volatile boolean refreshedWhileIdle;
 
@@ -100,6 +102,16 @@ public final class ScreenEncoder implements Runnable {
         return lastOutputMs;
     }
 
+    /**
+     * 看门狗用的「最后活动时刻」：还没出过帧时退回启动时刻。
+     *
+     * 否则 lastOutputMs==0 会让看门狗永远判不出「编码器从启动起就没出过帧」这种死局
+     * （例如 GL 节拍器在首帧前就挂了），用户只能干等。
+     */
+    public long lastActivityElapsedMs() {
+        return lastOutputMs != 0 ? lastOutputMs : startedAtMs;
+    }
+
     public void start(int width, int height, int dpi) throws IOException {
         synchronized (this) {
             if (running) {
@@ -118,6 +130,7 @@ public final class ScreenEncoder implements Runnable {
                 display.resize(width, height, dpi);
             }
             applyFrameRate();
+            startedAtMs = android.os.SystemClock.elapsedRealtime();
             running = true;
             thread = new Thread(this, "tvmirror-encode");
             thread.start();
@@ -159,6 +172,22 @@ public final class ScreenEncoder implements Runnable {
             }
             MediaCodec previous = codecObject;
             codecObject = null;
+            GlFramePacer previousPacer = pacer;
+            pacer = null;
+
+            // 先把新的编码器与节拍器都建好，再切换 VirtualDisplay 的输出，
+            // 最后才释放旧的 Surface。反过来做会让合成器在「旧 Surface 已释放」的
+            // 窗口里继续写帧（几十毫秒到几百毫秒），可能引发原生崩溃。
+            codecObject = createCodec(width, height);
+            Surface displaySurface = setupPacer(width, height);
+            if (display != null) {
+                display.setSurface(displaySurface);
+                display.resize(width, height, dpi);
+            }
+
+            if (previousPacer != null) {
+                previousPacer.release();
+            }
             if (previous != null) {
                 try {
                     previous.stop();
@@ -171,14 +200,8 @@ public final class ScreenEncoder implements Runnable {
                     // 已经释放
                 }
             }
-
-            codecObject = createCodec(width, height);
-            Surface displaySurface = setupPacer(width, height);
-            if (display != null) {
-                display.setSurface(displaySurface);
-                display.resize(width, height, dpi);
-            }
             applyFrameRate();
+            startedAtMs = android.os.SystemClock.elapsedRealtime();
             running = true;
             thread = new Thread(this, "tvmirror-encode");
             thread.start();
