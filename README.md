@@ -110,6 +110,32 @@ AVC 使用 High profile，但不指定 Level（`Level 4.2` 对 2880×1800 是非
 心跳回包（PONG）负载 16 字节：8 字节回显 + 4 字节丢帧数 + 4 字节解码帧数，
 手机端据此计算丢帧率并驱动自适应码率；PING 负载 4 字节，携带手机测得的上次 RTT。
 
+## 帧率控制（GlFramePacer）
+
+VirtualDisplay 是显示合成器，按面板刷新率出帧，无法通过 `MediaFormat` 或 `Surface.setFrameRate`
+限制。所以采集链路中间插了一层 GL：
+
+```
+VirtualDisplay → SurfaceTexture → GL（按目标帧率绘制）→ 编码器输入 Surface
+```
+
+每帧都会 `updateTexImage` 消化掉（否则生产端拿不回缓冲会卡死虚拟屏），
+但只有到达帧间隔才真正绘制并提交给编码器。EGL 初始化与 SurfaceTexture 创建都在渲染线程，
+因为 `updateTexImage` 必须在持有 EGL 上下文的同一线程调用。
+
+实测（1920×1200，滚动同一画面）：
+
+| 配置 | 编码器实际帧率 | 编码器输出码率 |
+|---|---|---|
+| 无节拍器 | 144–165 fps | 0.3–4.3 Mbps |
+| 节拍 60fps | 47–57 fps | 最高 25.4 Mbps |
+| 节拍 30fps | 29.3 fps | 最高 11.0 Mbps |
+
+GL 不可用时自动退回直连（`ScreenEncoder.USE_GL_PACING`），功能不受影响，只是帧率失控。
+
+调试用的「基准模式」：`adb shell am start -n app.tvmirror.phone/.CastActivity --ez bench true`，
+启动后只采集与编码、不连接电视，便于在不占用电视的情况下测量编码器输出。
+
 ## 已知限制
 
 - **不支持 Miracast 接收**。电视的 Wi-Fi Display 在 vendor HAL 里，框架没有公开服务，第三方 App 拿不到码流。这是本文档开头说的那个「锁」。TVMirror 用自建通道绕开它，代价是手机端也要装 App。
@@ -122,8 +148,11 @@ AVC 使用 High profile，但不指定 Level（`Level 4.2` 对 2880×1800 是非
 - **超过 1080p 的分辨率在这台电视上不可用**。`OMX.MS.AVC.Decoder` 声称支持 4096×2304，
   实测喂 2880×1800 会在收到配置帧时报 `ERROR(0x90000001)`，能力表与真实上限不一致。
   因此「自动」档停在 1080p 长边（`CastActivity.AUTO_NATIVE_CAP`）。
-- **实测码率由画面内容决定，不是设定值**。这颗编码器把 `bit_rate` 当上限：缓移镜头只有
-  0.5–1.8 Mbps，即使上限设 8 Mbps。改 CBR/VBR/CQ、改 profile 都不改变这一点。
+- **实测码率取决于帧率，不只是内容**。VirtualDisplay 会按面板刷新率（这台平板 144Hz）推帧，
+  而 `KEY_MAX_FPS_TO_ENCODER` 与 `Surface.setFrameRate` 都管不住它，编码器会按 144fps 工作，
+  每帧之间几乎无变化，于是只给极少的比特（实测 0.3–4.3 Mbps）。
+  现在用 `GlFramePacer`（SurfaceTexture + GL 按目标帧率渲染）把出帧率压到 30/60fps，
+  同场景下码率提升到 7.5–25 Mbps，画质随之明显改善。
 - **H.265 在 1080p 运动中会花屏**，1080p60 会闪黑（因此锁定 H.264）。
 - 首次连接必须输入配对码；配对码存在电视本地，卸载 App 才会重置。
 
