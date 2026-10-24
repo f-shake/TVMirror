@@ -108,9 +108,6 @@ final class GlFramePacer implements SurfaceTexture.OnFrameAvailableListener, Run
         ready.countDown();
 
         long lastDrawUs = 0;
-        long lastArriveUs = 0;
-        long emaIntervalUs = 0;
-        long lastGridUs = 0;
         long statStartMs = SystemClock.elapsedRealtime();
         int gotFrames = 0;
         int drawnFrames = 0;
@@ -131,31 +128,19 @@ final class GlFramePacer implements SurfaceTexture.OnFrameAvailableListener, Run
                 gotFrames++;
                 long nowUs = SystemClock.elapsedRealtimeNanos() / 1000;
                 long interval = 1_000_000L / Math.max(1, targetFps);
-
-                // 估计生产端自己的帧间隔（指数滑动平均）
-                if (lastArriveUs != 0) {
-                    long dt = nowUs - lastArriveUs;
-                    emaIntervalUs = emaIntervalUs == 0 ? dt : (emaIntervalUs * 7 + dt) / 8;
-                }
-                lastArriveUs = nowUs;
-
-                // 生产端本来就接近目标帧率时直通，不要拿网格去砍它：
-                // 63fps 的源硬塞 60fps 网格，每秒必然丢 3 帧，观感上就是「均匀地卡」。
-                boolean passThrough = emaIntervalUs != 0 && emaIntervalUs >= interval * 85 / 100;
-                if (passThrough) {
-                    lastGridUs = nowUs;
-                } else {
-                    // 面板远高于目标（如 144Hz）时才降采样，用固定网格避免漂移
-                    if (lastGridUs == 0) {
-                        lastGridUs = nowUs;
+                // 容差放宽到半个帧间隔：宁可多画一帧，也不要把「差一点没到点」的帧丢掉。
+                // 严格比较时 63fps 的源（15.9ms）会被稳定地隔一帧丢一帧。
+                if (nowUs - lastDrawUs < interval / 2) {
+                    if (SystemClock.elapsedRealtime() - statStartMs >= 5000) {
+                        long t = SystemClock.elapsedRealtime();
+                        android.util.Log.d("TVMirror", "节拍器 " + (t - statStartMs) + "ms: 收到 "
+                                + gotFrames + " 帧, 绘制 " + drawnFrames + " 帧 ("
+                                + (drawnFrames * 1000 / Math.max(1, t - statStartMs)) + " fps)");
+                        statStartMs = t;
+                        gotFrames = 0;
+                        drawnFrames = 0;
                     }
-                    if (nowUs < lastGridUs) {
-                        continue;
-                    }
-                    lastGridUs += interval;
-                    if (lastGridUs < nowUs - interval) {
-                        lastGridUs = nowUs;
-                    }
+                    continue;
                 }
                 lastDrawUs = nowUs;
                 drawFrame();
