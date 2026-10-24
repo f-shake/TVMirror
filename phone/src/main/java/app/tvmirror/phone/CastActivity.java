@@ -97,6 +97,16 @@ public final class CastActivity extends Activity {
             getSharedPreferences(PREFS, MODE_PRIVATE).edit()
                     .putInt("bufferMs", requestedBuffer).apply();
         }
+        // 从「投屏已暂停」通知进来：立刻重新申请录屏权限，恢复原会话
+        if (getIntent().getBooleanExtra("resume", false) && CaptureService.isRunning()) {
+            setStatus("投屏已暂停，正在重新申请录屏权限…");
+            handler.post(new Runnable() {
+                @Override
+                public void run() {
+                    launchProjection();
+                }
+            });
+        }
         setContentView(R.layout.activity_cast);
 
         statusView = findViewById(R.id.status);
@@ -506,6 +516,17 @@ public final class CastActivity extends Activity {
         }
         if (resultCode != RESULT_OK || data == null) {
             setStatus("需要录屏权限才能开始投屏");
+            return;
+        }
+
+        // 会话还在（只是录屏权限被收回）→ 只恢复采集，不重新连接
+        if (CaptureService.isRunning()) {
+            Intent resume = new Intent(this, CaptureService.class);
+            resume.setAction(CaptureService.ACTION_RESUME);
+            resume.putExtra(CaptureService.EXTRA_RESULT_CODE, resultCode);
+            resume.putExtra(CaptureService.EXTRA_RESULT_DATA, data);
+            startForegroundService(resume);
+            setStatus("正在恢复投屏…");
             return;
         }
 

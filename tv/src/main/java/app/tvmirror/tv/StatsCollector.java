@@ -131,7 +131,7 @@ public final class StatsCollector {
         if (idle < 5000) {
             return "";
         }
-        return "   ⚠ 源画面已停止 " + (idle / 1000) + "s";
+        return "   ⚠ 源画面已停止 " + (idle / 1000) + "s（手机锁屏或授权被收回，等待恢复）";
     }
 
     public synchronized float fps() {

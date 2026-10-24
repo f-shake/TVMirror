@@ -33,6 +33,8 @@ public final class CaptureService extends Service implements Sender.Listener {
     public static final String ACTION_STOP = "app.tvmirror.phone.STOP";
     /** 投屏进行中修改参数，不必重新申请录屏权限。 */
     public static final String ACTION_UPDATE = "app.tvmirror.phone.UPDATE";
+    /** 录屏权限被收回后重新拿到授权：只重建采集管线，TCP 会话保持不变。 */
+    public static final String ACTION_RESUME = "app.tvmirror.phone.RESUME";
 
     public static final String EXTRA_RESULT_CODE = "resultCode";
     public static final String EXTRA_RESULT_DATA = "resultData";
@@ -84,6 +86,9 @@ public final class CaptureService extends Service implements Sender.Listener {
     private volatile boolean recovering;
     /** 屏幕是否处于熄灭/锁屏状态。锁屏时系统不再向虚拟屏送内容，看门狗不该误判为故障。 */
     private volatile boolean screenOff;
+    /** 采集管线是否因为录屏权限被收回而暂停（TCP 会话仍然保持）。 */
+    private volatile boolean paused;
+    private volatile String codecName = "avc";
     private volatile Preset preset;
     private String targetHost = "";
     private volatile AdaptiveBitrate adaptive;
@@ -111,6 +116,11 @@ public final class CaptureService extends Service implements Sender.Listener {
         }
         if (ACTION_UPDATE.equals(intent.getAction())) {
             applyUpdate(intent);
+            return START_STICKY;
+        }
+        if (ACTION_RESUME.equals(intent.getAction())) {
+            resumeCasting(intent.getIntExtra(EXTRA_RESULT_CODE, 0),
+                    intent.getParcelableExtra(EXTRA_RESULT_DATA));
             return START_STICKY;
         }
 
@@ -151,14 +161,120 @@ public final class CaptureService extends Service implements Sender.Listener {
             @Override
             public void onStop() {
                 // 系统在锁屏、切换用户、或另一个采集应用抢占时会回收投影。
-                // 明确告诉用户原因，而不是静默断开。
-                fail("系统已收回录屏权限（锁屏或被其他录屏占用），请重新开始投屏");
+                // 不结束会话：只暂停采集，等用户重新授权后接着投。
+                pauseCasting("系统收回录屏权限（锁屏或被其他录屏占用）");
             }
         }, null);
 
         acquireWakeLock();
+        codecName = codec;
         startSession(codec, pin, port, wantAudio);
         return START_STICKY;
+    }
+
+    /**
+     * 录屏权限被收回：暂停采集，但保持 TCP 会话。
+     *
+     * 电视端会停留在最后一帧并显示「源画面已停止」，用户重新授权后
+     * 只重建采集管线即可继续投，不用重新配对、重新连接。
+     */
+    private void pauseCasting(String reason) {
+        if (!running) {
+            return;
+        }
+        paused = true;
+        ScreenEncoder enc = encoder;
+        encoder = null;
+        if (enc != null) {
+            try {
+                enc.stop();
+            } catch (RuntimeException ignored) {
+                // 投影已被系统终止，释放可能失败
+            }
+        }
+        MediaProjection p = projection;
+        projection = null;
+        if (p != null) {
+            try {
+                p.stop();
+            } catch (RuntimeException ignored) {
+                // 已经被系统停止了
+            }
+        }
+        lastError = reason + "，点按恢复投屏";
+        updateNotification("投屏已暂停：" + reason);
+        postResumeNotification(reason);
+    }
+
+    /** 补一条可点按的通知：锁屏时用户也能看到并直接恢复。 */
+    private void postResumeNotification(String reason) {
+        android.app.NotificationManager nm =
+                (android.app.NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+        if (nm == null) {
+            return;
+        }
+        android.content.Intent resume = new android.content.Intent(this, CastActivity.class)
+                .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK
+                        | android.content.Intent.FLAG_ACTIVITY_SINGLE_TOP)
+                .putExtra("resume", true);
+        android.app.PendingIntent pi = android.app.PendingIntent.getActivity(this, 1, resume,
+                android.app.PendingIntent.FLAG_UPDATE_CURRENT
+                        | android.app.PendingIntent.FLAG_IMMUTABLE);
+        android.app.Notification n = new android.app.Notification.Builder(this, CHANNEL_ID)
+                .setContentTitle("投屏已暂停")
+                .setContentText(reason + "，点按恢复")
+                .setSmallIcon(R.drawable.ic_launcher)
+                .setContentIntent(pi)
+                .setAutoCancel(true)
+                .setOngoing(true)
+                .build();
+        nm.notify(NOTIFICATION_ID + 1, n);
+    }
+
+    /** 重新拿到录屏授权：只重建采集管线，沿用现有会话。 */
+    private void resumeCasting(final int resultCode, final Intent resultData) {
+        if (resultData == null || !running) {
+            return;
+        }
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    MediaProjectionManager manager =
+                            (MediaProjectionManager) getSystemService(MEDIA_PROJECTION_SERVICE);
+                    MediaProjection fresh = manager.getMediaProjection(resultCode, resultData);
+                    if (fresh == null) {
+                        lastError = "恢复失败：没有拿到录屏授权";
+                        return;
+                    }
+                    fresh.registerCallback(new MediaProjection.Callback() {
+                        @Override
+                        public void onStop() {
+                            pauseCasting("系统收回录屏权限（锁屏或被其他录屏占用）");
+                        }
+                    }, null);
+                    projection = fresh;
+                    paused = false;
+                    int[] size = computeSize();
+                    ScreenEncoder enc = new ScreenEncoder(projection, createSink(), codecName,
+                            targetFps, targetBitrate, preset.iFrameSeconds,
+                            preset == Preset.QUALITY);
+                    enc.start(size[0], size[1], size[2]);
+                    encoder = enc;
+                    Sender s = sender;
+                    if (s != null) {
+                        s.sendFormat(size[0], size[1]);
+                    }
+                    lastError = null;
+                    updateNotification("正在投屏到 " + targetHost);
+                    startWatchdog();
+                    Log.i(TAG, "采集管线已恢复");
+                } catch (Exception e) {
+                    lastError = "恢复失败：" + e.getMessage();
+                    Log.w(TAG, "恢复失败: " + e.getMessage());
+                }
+            }
+        }, "tvmirror-resume").start();
     }
 
     /**
@@ -217,6 +333,37 @@ public final class CaptureService extends Service implements Sender.Listener {
         }, "tvmirror-update").start();
     }
 
+    /** 采集输出 → 会话发送。恢复时也要用同一份，所以抽出来。 */
+    private ScreenEncoder.Sink createSink() {
+        return new ScreenEncoder.Sink() {
+            @Override
+            public void onConfig(byte[] data, long ptsUs) {
+                Sender s = sender;
+                if (s == null) {
+                    return;
+                }
+                try {
+                    s.sendConfig(data, ptsUs);
+                } catch (Exception e) {
+                    stopSelf();
+                }
+            }
+
+            @Override
+            public void onVideo(byte[] data, long ptsUs) {
+                Sender s = sender;
+                if (s == null) {
+                    return;
+                }
+                try {
+                    s.sendVideo(data, ptsUs);
+                } catch (Exception e) {
+                    stopSelf();
+                }
+            }
+        };
+    }
+
     /**
      * 先发 BYE 再停服务。
      *
@@ -265,33 +412,8 @@ public final class CaptureService extends Service implements Sender.Listener {
                     Log.i(TAG, "基准模式：只采集与编码，不连接电视");
                 }
 
-                encoder = new ScreenEncoder(projection, new ScreenEncoder.Sink() {
-                    @Override
-                    public void onConfig(byte[] data, long ptsUs) {
-                        Sender s = sender;
-                        if (s == null) {
-                            return;
-                        }
-                        try {
-                            s.sendConfig(data, ptsUs);
-                        } catch (Exception e) {
-                            stopSelf();
-                        }
-                    }
-
-                    @Override
-                    public void onVideo(byte[] data, long ptsUs) {
-                        Sender s = sender;
-                        if (s == null) {
-                            return;
-                        }
-                        try {
-                            s.sendVideo(data, ptsUs);
-                        } catch (Exception e) {
-                            stopSelf();
-                        }
-                    }
-                }, codec, targetFps, targetBitrate, preset.iFrameSeconds,
+                encoder = new ScreenEncoder(projection, createSink(), codec,
+                        targetFps, targetBitrate, preset.iFrameSeconds,
                         preset == Preset.QUALITY);
 
                 try {
@@ -359,6 +481,10 @@ public final class CaptureService extends Service implements Sender.Listener {
                     }
                     if (!running) {
                         return;
+                    }
+                    if (paused) {
+                        recovering = false;
+                        continue;
                     }
                     // 息屏瞬间广播可能还没到，先直接问电源状态：
                     // 否则会把「锁屏导致没有画面」误判成故障，去重建编码器
