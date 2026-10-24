@@ -106,7 +106,7 @@ public final class CaptureService extends Service implements Sender.Listener {
             return START_NOT_STICKY;
         }
         if (ACTION_STOP.equals(intent.getAction())) {
-            stopSelf();
+            stopGracefully();
             return START_NOT_STICKY;
         }
         if (ACTION_UPDATE.equals(intent.getAction())) {
@@ -215,6 +215,27 @@ public final class CaptureService extends Service implements Sender.Listener {
                 }
             }
         }, "tvmirror-update").start();
+    }
+
+    /**
+     * 先发 BYE 再停服务。
+     *
+     * 网络写必须在后台线程：onStartCommand / onDestroy 都跑在主线程，
+     * 直接 socket.write 会抛 NetworkOnMainThreadException（实测导致闪退）。
+     */
+    private void stopGracefully() {
+        final Sender s = sender;
+        sender = null;
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                if (s != null) {
+                    s.sendBye();
+                    s.close();
+                }
+                stopSelf();
+            }
+        }, "tvmirror-stop").start();
     }
 
     private void startSession(final String codec, final String pin, final int port,
@@ -565,8 +586,8 @@ public final class CaptureService extends Service implements Sender.Listener {
             audioEncoder = null;
         }
         if (sender != null) {
-            // 先发 BYE 再断开：否则电视端读到 EOF 会当成异常断开并弹错误提示
-            sender.sendBye();
+            // 正常停止走 stopGracefully() 发 BYE；能走到这里说明是异常路径，
+            // 主线程不能做网络写，直接关闭即可
             sender.close();
             sender = null;
         }
