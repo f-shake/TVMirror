@@ -43,11 +43,19 @@ public final class MirrorActivity extends Activity
     private AudioDecoder audio;
 
     private final Handler handler = new Handler(Looper.getMainLooper());
+    /** 上次把统计打进 logcat 的时刻；浮层被视频画面盖住时靠它取数。 */
+    private long lastStatLogMs;
     private final Runnable statsTick = new Runnable() {
         @Override
         public void run() {
             if (session != null) {
-                statsView.setText(session.stats.describe());
+                String line = session.stats.describe();
+                statsView.setText(line);
+                long now = android.os.SystemClock.elapsedRealtime();
+                if (now - lastStatLogMs >= 1000) {
+                    lastStatLogMs = now;
+                    android.util.Log.d("TVMirror", "统计 " + line);
+                }
             }
             handler.postDelayed(this, 500);
         }
