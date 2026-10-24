@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">TVMirror 投屏</string>
+    <string name="subtitle">手机画面投到电视，局域网直连，无广告</string>
+    <string name="status_idle">准备就绪</string>
+    <string name="scan">搜索电视</string>
+    <string name="start">开始投屏</string>
+    <string name="stop">停止投屏</string>
+    <string name="label_tv">电视</string>
+    <string name="device_none">尚未搜索到电视</string>
+    <string name="label_ip">电视地址</string>
+    <string name="hint_ip">例如 192.168.0.88</string>
+    <string name="pin_hint">配对码</string>
+    <string name="hint_pin">电视上显示的 4 位数字</string>
+    <string name="preset_label">模式</string>
+    <string name="codec_label">编码</string>
+    <string name="fps_label">帧率上限</string>
+    <string name="bitrate_label">码率上限</string>
+    <string name="resolution_label">分辨率上限</string>
+    <string name="quality_title">画质</string>
+</resources>

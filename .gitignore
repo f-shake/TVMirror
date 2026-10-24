@@ -1,0 +1,23 @@
+# 构建产物
+build/
+.gradle/
+*.apk
+*.aab
+*.iml
+.idea/
+.externalNativeBuild/
+.cxx/
+
+# 本机路径，不进仓库
+local.properties
+
+# 签名材料，绝不入库
+signing/
+
+# 本地联调产物
+out/
+*.log
+
+# Python 缓存
+__pycache__/
+*.pyc

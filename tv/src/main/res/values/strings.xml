@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">TVMirror 投屏</string>
+    <string name="standby_title">等待手机连接</string>
+    <string name="standby_hint">手机与电视连同一个 Wi-Fi，打开本机 App 即可</string>
+    <string name="label_ip">本机地址</string>
+    <string name="label_pin">配对码</string>
+</resources>

@@ -1,0 +1,111 @@
+package app.tvmirror.tv;
+
+/**
+ * 接收端统计：1 秒滑动窗口算帧率与码率，并记录两个不同口径的耗时。
+ *
+ * 「解码」= 送入解码器 → 上屏，纯本地量，不受跨设备时钟影响。
+ * 「端到端」= 手机出帧 → 电视上屏。需要把手机时间戳换算到本地时钟：
+ * 时差由心跳估算，并减掉单向网络延迟（RTT/2），否则会系统性偏小约半个 RTT。
+ * 静态画面下这个值会偏大——它显示的是最后一帧的年龄，不是链路卡顿。
+ */
+public final class StatsCollector {
+
+    private long windowStartUs;
+    private long framesInWindow;
+    private long bytesInWindow;
+
+    private float fps;
+    private float kbps;
+    private int lastLatencyMs;
+    private long totalFrames;
+    private long droppedFrames;
+    private long lastReportedDrops;
+    private long lastReportedFrames;
+    private int width;
+    private int height;
+    private int rttMs;
+    /** 电视时钟 − 手机时钟（微秒）；由心跳算出，用于把帧时间戳换算到本地时钟。 */
+    private long clockOffsetUs = Long.MIN_VALUE;
+    private int endToEndMs;
+
+    public synchronized void setResolution(int width, int height) {
+        this.width = width;
+        this.height = height;
+    }
+
+    /** 手机端测得的往返时延，随心跳带过来。 */
+    public synchronized void setRtt(int rttMs) {
+        this.rttMs = rttMs;
+    }
+
+    public synchronized void setClockOffset(long offsetUs) {
+        this.clockOffsetUs = offsetUs;
+    }
+
+    public synchronized void onFrame(int sizeBytes, long captureUs, long arrivalUs, long nowUs) {
+        if (windowStartUs == 0) {
+            windowStartUs = nowUs;
+        }
+        framesInWindow++;
+        bytesInWindow += sizeBytes;
+        totalFrames++;
+
+        long decodeMs = (nowUs - arrivalUs) / 1000;
+        if (decodeMs >= 0 && decodeMs < 5000) {
+            lastLatencyMs = (int) decodeMs;
+        }
+
+        // 端到端：手机出帧时刻（换算到本地时钟）→ 此刻上屏
+        if (clockOffsetUs != Long.MIN_VALUE && captureUs > 0) {
+            long e2e = (nowUs - (captureUs + clockOffsetUs)) / 1000;
+            if (e2e >= 0 && e2e < 5000) {
+                endToEndMs = (int) e2e;
+            }
+        }
+
+        long elapsed = nowUs - windowStartUs;
+        if (elapsed >= 1_000_000) {
+            fps = framesInWindow * 1_000_000f / elapsed;
+            kbps = bytesInWindow * 8f * 1_000_000f / elapsed / 1000f;
+            framesInWindow = 0;
+            bytesInWindow = 0;
+            windowStartUs = nowUs;
+        }
+    }
+
+    public synchronized void onDropped() {
+        droppedFrames++;
+    }
+
+    public synchronized String describe() {
+        String resolution = width > 0 ? width + "x" + height : "--";
+        return String.format(java.util.Locale.US,
+                "分辨率 %s   帧率 %.1f fps   码率 %.1f Mbps   端到端 %d ms   解码 %d ms   网络 %d ms   丢 %d",
+                resolution, fps, kbps / 1000f, endToEndMs, lastLatencyMs, rttMs, droppedFrames);
+    }
+
+    public synchronized float fps() {
+        return fps;
+    }
+
+    public synchronized int lastLatencyMs() {
+        return lastLatencyMs;
+    }
+
+    public synchronized long totalFrames() {
+        return totalFrames;
+    }
+
+    public synchronized long droppedFrames() {
+        return droppedFrames;
+    }
+
+    /** 自上次调用以来新增的丢帧数与解码帧数，用于回传给手机做自适应。 */
+    public synchronized int[] takeDelta() {
+        int dropped = (int) (droppedFrames - lastReportedDrops);
+        int decoded = (int) (totalFrames - lastReportedFrames);
+        lastReportedDrops = droppedFrames;
+        lastReportedFrames = totalFrames;
+        return new int[]{dropped, decoded};
+    }
+}
