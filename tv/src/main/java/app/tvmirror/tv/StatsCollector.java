@@ -31,6 +31,8 @@ public final class StatsCollector {
     private long receivedFrames;
     private long decodedFrames;
     private long displayedFrames;
+    /** 最近一次收到视频帧的本地时刻；用来判断源画面是否已经停了。 */
+    private long lastVideoMs;
 
     public synchronized void setResolution(int width, int height) {
         this.width = width;
@@ -82,6 +84,7 @@ public final class StatsCollector {
     public synchronized void onReceived(int payloadBytes) {
         bytesInWindow += Math.max(0, payloadBytes);
         receivedFrames++;
+        lastVideoMs = android.os.SystemClock.elapsedRealtime();
     }
 
     /** 解码器吐出一帧（无论是否上屏）。 */
@@ -113,9 +116,22 @@ public final class StatsCollector {
     public synchronized String describe() {
         String resolution = width > 0 ? width + "x" + height : "--";
         return String.format(java.util.Locale.US,
-                "分辨率 %s   帧率 %.1f fps   码率 %.1f Mbps   端到端 %d ms   解码 %d ms   网络 %d ms   收 %d   解 %d   显 %d   丢 %d   晚 %d",
+                "分辨率 %s   帧率 %.1f fps   码率 %.1f Mbps   端到端 %d ms   解码 %d ms   网络 %d ms   收 %d   解 %d   显 %d   丢 %d   晚 %d%s",
                 resolution, fps, kbps / 1000f, endToEndMs, lastLatencyMs, rttMs,
-                receivedFrames, decodedFrames, displayedFrames, droppedFrames, lateFrames);
+                receivedFrames, decodedFrames, displayedFrames, droppedFrames, lateFrames,
+                stalledHint());
+    }
+
+    /** 源画面停了就明确写出来：会话还活着但收不到帧，画面会冻在最后一帧。 */
+    private String stalledHint() {
+        if (lastVideoMs == 0) {
+            return "";
+        }
+        long idle = android.os.SystemClock.elapsedRealtime() - lastVideoMs;
+        if (idle < 5000) {
+            return "";
+        }
+        return "   ⚠ 源画面已停止 " + (idle / 1000) + "s";
     }
 
     public synchronized float fps() {

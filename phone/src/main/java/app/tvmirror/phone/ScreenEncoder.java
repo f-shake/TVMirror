@@ -95,6 +95,11 @@ public final class ScreenEncoder implements Runnable {
         return bitrate;
     }
 
+    /** 最近一次产出编码帧的时刻（毫秒）。0 表示还没产出过。 */
+    public long lastOutputElapsedMs() {
+        return lastOutputMs;
+    }
+
     public void start(int width, int height, int dpi) throws IOException {
         synchronized (this) {
             if (running) {

@@ -79,6 +79,11 @@ public final class CaptureService extends Service implements Sender.Listener {
     private boolean mutedSource;
     /** 周期性重申静音的任务；MIUI 的音量记忆会把音量恢复，单次静音不够。 */
     private Thread muteKeeper;
+    /** 看门狗：画面长时间没有输出时尝试恢复，恢复不了就明确报错，而不是静默冻结。 */
+    private Thread watchdog;
+    private volatile boolean recovering;
+    /** 屏幕是否处于熄灭/锁屏状态。锁屏时系统不再向虚拟屏送内容，看门狗不该误判为故障。 */
+    private volatile boolean screenOff;
     private volatile Preset preset;
     private String targetHost = "";
     private volatile AdaptiveBitrate adaptive;
@@ -145,7 +150,9 @@ public final class CaptureService extends Service implements Sender.Listener {
         projection.registerCallback(new MediaProjection.Callback() {
             @Override
             public void onStop() {
-                stopSelf();
+                // 系统在锁屏、切换用户、或另一个采集应用抢占时会回收投影。
+                // 明确告诉用户原因，而不是静默断开。
+                fail("系统已收回录屏权限（锁屏或被其他录屏占用），请重新开始投屏");
             }
         }, null);
 
@@ -305,11 +312,96 @@ public final class CaptureService extends Service implements Sender.Listener {
                         : "正在投屏到 " + targetHost);
                 muteSourceAudio();
                 registerDisplayListener();
+                startWatchdog();
             }
         }, "tvmirror-start").start();
     }
 
+    /**
+     * 画面看门狗。
+     *
+     * 触发场景：手机开始用系统录屏、或在投屏中打开另一个采集类应用时，
+     * 系统会重排显示管线，我们的 VirtualDisplay 不再收到新帧——
+     * 但 TCP 会话和心跳都还活着，电视端会「冻结在最后一帧」且没有任何提示。
+     *
+     * 这里先尝试重建一次编码器；仍无输出就明确失败，让用户重新开始，而不是干等。
+     */
+    private void startWatchdog() {
+        watchdog = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                while (running) {
+                    try {
+                        Thread.sleep(2000);
+                    } catch (InterruptedException e) {
+                        return;
+                    }
+                    if (!running) {
+                        return;
+                    }
+                    if (screenOff) {
+                        // 锁屏期间没有画面是正常的，不要重建、更不要判失败
+                        recovering = false;
+                        continue;
+                    }
+                    ScreenEncoder enc = encoder;
+                    if (enc == null) {
+                        continue;
+                    }
+                    long last = enc.lastOutputElapsedMs();
+                    long idle = android.os.SystemClock.elapsedRealtime()
+                            - (last == 0 ? android.os.SystemClock.elapsedRealtime() : last);
+                    if (last == 0) {
+                        continue;
+                    }
+                    if (idle < 4000) {
+                        recovering = false;
+                        continue;
+                    }
+                    if (!recovering) {
+                        recovering = true;
+                        Log.w(TAG, "画面 " + idle + "ms 无输出，尝试重建编码器");
+                        try {
+                            int[] size = computeSize();
+                            enc.restart(size[0], size[1], size[2]);
+                            Sender s = sender;
+                            if (s != null) {
+                                s.sendFormat(size[0], size[1]);
+                            }
+                        } catch (Exception e) {
+                            fail("画面已停止，且无法恢复：" + e.getMessage());
+                            return;
+                        }
+                    } else {
+                        fail("画面已停止（可能被系统录屏或其他采集应用占用），请重新开始投屏");
+                        return;
+                    }
+                }
+            }
+        }, "tvmirror-watchdog");
+        watchdog.start();
+    }
+
     private void registerDisplayListener() {
+        // 锁屏/亮屏：锁屏后系统不再向虚拟屏送内容，看门狗必须知道这是正常现象
+        android.content.IntentFilter filter = new android.content.IntentFilter();
+        filter.addAction(android.content.Intent.ACTION_SCREEN_OFF);
+        filter.addAction(android.content.Intent.ACTION_SCREEN_ON);
+        filter.addAction(android.content.Intent.ACTION_USER_PRESENT);
+        registerReceiver(new android.content.BroadcastReceiver() {
+            @Override
+            public void onReceive(android.content.Context context, android.content.Intent intent) {
+                String action = intent.getAction();
+                if (android.content.Intent.ACTION_SCREEN_OFF.equals(action)) {
+                    screenOff = true;
+                    Log.i(TAG, "屏幕熄灭，暂停看门狗");
+                } else if (android.content.Intent.ACTION_SCREEN_ON.equals(action)
+                        || android.content.Intent.ACTION_USER_PRESENT.equals(action)) {
+                    screenOff = false;
+                    Log.i(TAG, "屏幕点亮，恢复看门狗");
+                }
+            }
+        }, filter);
         DisplayManager dm = (DisplayManager) getSystemService(DISPLAY_SERVICE);
         if (dm == null) {
             return;
@@ -455,6 +547,10 @@ public final class CaptureService extends Service implements Sender.Listener {
     @Override
     public void onDestroy() {
         running = false;
+        if (watchdog != null) {
+            watchdog.interrupt();
+            watchdog = null;
+        }
         if (muteKeeper != null) {
             muteKeeper.interrupt();
             muteKeeper = null;
