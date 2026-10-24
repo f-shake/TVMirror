@@ -70,8 +70,6 @@ public final class VideoDecoder implements Runnable {
     private static final int MIN_PENDING_FRAMES = 6;
     /** 已解码但还没到呈现时刻的帧：{bufferIndex, 到期时刻us, 字节数, 手机出帧时刻us}。 */
     private final java.util.ArrayDeque<long[]> pending = new java.util.ArrayDeque<>();
-    /** 按送入顺序记录视频帧的手机时间戳，输出时按同序取用。 */
-    private final java.util.ArrayDeque<Long> fedPts = new java.util.ArrayDeque<>();
 
     /** 上一帧排定的呈现时刻（微秒），用来把输出排成等间隔。 */
     private long lastDueUs;
@@ -207,7 +205,6 @@ public final class VideoDecoder implements Runnable {
             // 必须持 presentLock：上屏线程正在同一个队列上取帧。
             synchronized (presentLock) {
                 pending.clear();
-                fedPts.clear();
                 releaseCodec();
                 openCodec();
             }
@@ -340,14 +337,6 @@ public final class VideoDecoder implements Runnable {
             codec.queueInputBuffer(index, 0, payload.length, ptsUs, flags);
             if (flags == MediaCodec.BUFFER_FLAG_CODEC_CONFIG) {
                 android.util.Log.d("TVMirror", "已送入配置帧 " + payload.length + " 字节");
-            } else {
-                // 按送入顺序记录手机出帧时刻，输出时同序取出算端到端。
-                // 队列必须有上限：一旦与输出不再一一对应（解码器丢帧/补帧），
-                // 它会永久错位且无限增长，端到端与缓冲都会失真。
-                fedPts.addLast(ptsUs);
-                while (fedPts.size() > 240) {
-                    fedPts.pollFirst();
-                }
             }
         } catch (RuntimeException e) {
             android.util.Log.e("TVMirror", "送入帧失败 size=" + payload.length + " flags=" + flags, e);
@@ -384,9 +373,13 @@ public final class VideoDecoder implements Runnable {
                 // 源视频常常不是目标帧率（例如 24fps 内容、30fps 网格），
                 // 套网格会让两套节奏互相踩，看起来就是一顿一顿。
                 long nowUs = SystemClock.elapsedRealtimeNanos() / 1000;
-                Long captureUs = fedPts.pollFirst();
+                // 直接用解码器带回的 PTS 作为采集时刻：
+                // MediaCodec 会把送入时的 pts 原样放到输出 BufferInfo 上，
+                // 所以它天然与这一帧一一对应。之前用「送入队列按序取」的假设，
+                // 一旦解码器丢帧/补帧就永久错位，bufferMs 会静默失效。
+                long captureUs = info.presentationTimeUs;
                 long dueUs;
-                if (captureUs != null && captureUs > 0 && clockOffsetUs != Long.MIN_VALUE) {
+                if (captureUs > 0 && clockOffsetUs != Long.MIN_VALUE) {
                     dueUs = captureUs + clockOffsetUs + presentationDelayUs();
                     // 采集时刻换算过来可能已经过期（首帧、校时重置），别让它立刻扎堆上屏
                     if (dueUs < nowUs) {
@@ -406,8 +399,7 @@ public final class VideoDecoder implements Runnable {
                 }
                 lastDueUs = dueUs;
                 synchronized (presentLock) {
-                    pending.addLast(new long[]{out, dueUs, info.size,
-                            captureUs == null ? -1 : captureUs});
+                    pending.addLast(new long[]{out, dueUs, info.size, captureUs});
                     // 缓冲太多说明呈现线程跟不上，放掉最旧的一帧，避免解码器被占满
                     while (pending.size() > maxPendingFrames()) {
                         releaseOne();
