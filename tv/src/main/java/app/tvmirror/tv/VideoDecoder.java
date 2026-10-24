@@ -75,6 +75,8 @@ public final class VideoDecoder implements Runnable {
 
     /** 上一帧排定的呈现时刻（微秒），用来把输出排成等间隔。 */
     private long lastDueUs;
+    /** 电视时钟 − 手机时钟（微秒），由心跳校准；用来把采集时刻换算成本地时刻。 */
+    private volatile long clockOffsetUs = Long.MIN_VALUE;
     /** 手机在握手时指定的缓冲时长（微秒）；0 表示用默认小缓冲。 */
     private final long bufferDelayUs;
 
@@ -273,7 +275,9 @@ public final class VideoDecoder implements Runnable {
             // 减掉 RTT/2 才是真正的时钟差；否则端到端会系统性偏小。
             int phoneRtt = (pingPayload != null && pingPayload.length >= 4)
                     ? FrameHeader.getInt(pingPayload, 0) : 0;
-            session.stats.setClockOffset(tvNowUs - phoneUs - phoneRtt * 500L);
+            long offset = tvNowUs - phoneUs - phoneRtt * 500L;
+            clockOffsetUs = offset;
+            session.stats.setClockOffset(offset);
             int[] delta = session.stats.takeDelta();
             // 回包：8 字节回显 + 4 字节丢帧 + 4 字节解码帧，手机据此判断是否需要降码率
             byte[] payload = new byte[16];
@@ -358,26 +362,36 @@ public final class VideoDecoder implements Runnable {
                 continue;
             }
             if (out >= 0) {
+                session.stats.onDecoded();
                 if (info.size <= 0) {
                     codec.releaseOutputBuffer(out, false);
                     continue;
                 }
-                // 等间隔上屏：不是「解码完 + 固定延迟」，而是按帧间隔顺延。
-                // 后者会把网络抖动原样传到屏幕上（到得早早就早显示、晚就晚显示），
-                // 看起来就是「没丢帧但一顿一顿」。
+                // 上屏时刻按「采集时刻 + 缓冲」还原，而不是套一个固定帧率网格。
+                // 源视频常常不是目标帧率（例如 24fps 内容、30fps 网格），
+                // 套网格会让两套节奏互相踩，看起来就是一顿一顿。
                 long nowUs = SystemClock.elapsedRealtimeNanos() / 1000;
-                long intervalUs = 1_000_000L / Math.max(24,
-                        session.handshake == null ? 60 : session.handshake.fps);
-                long minDueUs = nowUs + presentationDelayUs();
-                long dueUs = lastDueUs == 0
-                        ? minDueUs
-                        : Math.max(minDueUs, lastDueUs + intervalUs);
-                // 长时间停顿后不要一路追赶，直接以当前时间为基点
-                if (dueUs - nowUs > presentationDelayUs() * 4) {
-                    dueUs = minDueUs;
+                Long captureUs = fedPts.pollFirst();
+                long dueUs;
+                if (captureUs != null && captureUs > 0 && clockOffsetUs != Long.MIN_VALUE) {
+                    dueUs = captureUs + clockOffsetUs + presentationDelayUs();
+                    // 采集时刻换算过来可能已经过期（首帧、校时重置），别让它立刻扎堆上屏
+                    if (dueUs < nowUs) {
+                        dueUs = nowUs;
+                    }
+                } else {
+                    dueUs = nowUs + presentationDelayUs();
+                    if (lastDueUs != 0) {
+                        long intervalUs = 1_000_000L / Math.max(24,
+                                session.handshake == null ? 60 : session.handshake.fps);
+                        dueUs = Math.max(dueUs, lastDueUs + intervalUs);
+                    }
+                }
+                long maxAheadUs = presentationDelayUs() + 500_000L;
+                if (dueUs - nowUs > maxAheadUs) {
+                    dueUs = nowUs + presentationDelayUs();
                 }
                 lastDueUs = dueUs;
-                Long captureUs = fedPts.pollFirst();
                 synchronized (presentLock) {
                     pending.addLast(new long[]{out, dueUs, info.size,
                             captureUs == null ? -1 : captureUs});
@@ -410,6 +424,7 @@ public final class VideoDecoder implements Runnable {
         } catch (RuntimeException e) {
             return;
         }
+        session.stats.onDisplayed();
         session.stats.onFrame((int) item[2], item[3], lastFeedUs, nowUs);
         if (!firstFrameSeen) {
             firstFrameSeen = true;

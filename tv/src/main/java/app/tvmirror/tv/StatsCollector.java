@@ -28,6 +28,9 @@ public final class StatsCollector {
     private long clockOffsetUs = Long.MIN_VALUE;
     private int endToEndMs;
     private long lateFrames;
+    private long receivedFrames;
+    private long decodedFrames;
+    private long displayedFrames;
 
     public synchronized void setResolution(int width, int height) {
         this.width = width;
@@ -78,6 +81,17 @@ public final class StatsCollector {
     /** 收到一个视频帧时调用，用负载长度统计真实码流码率。 */
     public synchronized void onReceived(int payloadBytes) {
         bytesInWindow += Math.max(0, payloadBytes);
+        receivedFrames++;
+    }
+
+    /** 解码器吐出一帧（无论是否上屏）。 */
+    public synchronized void onDecoded() {
+        decodedFrames++;
+    }
+
+    /** 一帧真正上屏。 */
+    public synchronized void onDisplayed() {
+        displayedFrames++;
     }
 
     /**
@@ -99,9 +113,9 @@ public final class StatsCollector {
     public synchronized String describe() {
         String resolution = width > 0 ? width + "x" + height : "--";
         return String.format(java.util.Locale.US,
-                "分辨率 %s   帧率 %.1f fps   码率 %.1f Mbps   端到端 %d ms   解码 %d ms   网络 %d ms   丢 %d   晚 %d",
-                resolution, fps, kbps / 1000f, endToEndMs, lastLatencyMs, rttMs, droppedFrames,
-                lateFrames);
+                "分辨率 %s   帧率 %.1f fps   码率 %.1f Mbps   端到端 %d ms   解码 %d ms   网络 %d ms   收 %d   解 %d   显 %d   丢 %d   晚 %d",
+                resolution, fps, kbps / 1000f, endToEndMs, lastLatencyMs, rttMs,
+                receivedFrames, decodedFrames, displayedFrames, droppedFrames, lateFrames);
     }
 
     public synchronized float fps() {
